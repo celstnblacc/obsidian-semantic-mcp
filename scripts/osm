@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# osm — Obsidian Semantic MCP CLI wrapper
+#
+# Usage:
+#   scripts/osm init       Interactive setup wizard
+#   scripts/osm status     Check service health
+#   scripts/osm rebuild    Rebuild Docker images
+#
+# If uv is available, uses the project venv automatically.
+# Otherwise falls back to system python3.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WIZARD="$PROJECT_ROOT/osm_init.py"
+
+if command -v uv &>/dev/null; then
+    exec uv run --project "$PROJECT_ROOT" python3 "$WIZARD" "$@"
+else
+    exec python3 "$WIZARD" "$@"
+fi

@@ -16,5 +16,8 @@ dev = [
     "pytest>=9.0.2",
 ]
 
+[project.scripts]
+osm = "osm_init:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests/test_unit.py"]

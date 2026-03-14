@@ -39,23 +39,27 @@ Your Obsidian vault ($HOME/.obsidian)
 
 ```
 obsidian-semantic-mcp/
+├── scripts/
+│   └── osm                # CLI wrapper — run `scripts/osm init` to set up
 ├── src/
 │   ├── server.py          # MCP server — semantic search + vault CRUD (10 tools)
 │   └── dashboard.py       # Monitoring dashboard (http://localhost:8484)
 ├── tests/
 │   ├── test_setup.py      # Prerequisites checker (deps, DB, Ollama)
 │   └── test_e2e.py        # End-to-end MCP protocol test
+├── osm_init.py            # Interactive setup wizard (used by scripts/osm)
 ├── Dockerfile             # Python 3.13 + uv
 ├── docker-compose.yml     # Full stack: postgres, ollama, server, dashboard
-├── pyproject.toml         # Project metadata + dependencies
+├── pyproject.toml         # Project metadata + dependencies (osm script entry)
 ├── uv.lock                # Pinned lockfile
 └── LICENSE                # Apache 2.0
 ```
 
 ## Prerequisites
 
-- **Docker & Docker Compose** — works on macOS, Linux, Windows/WSL2
 - An Obsidian vault on your filesystem
+- **macOS native:** Homebrew (auto-installs everything else)
+- **Docker modes:** Docker Desktop (macOS/Linux/Windows WSL2)
 
 ## Quick Start
 
@@ -65,13 +69,46 @@ obsidian-semantic-mcp/
 git clone <repo-url> && cd obsidian-semantic-mcp
 ```
 
-### 2. Start the stack
+### 2. Run the setup wizard
+
+```bash
+scripts/osm init
+```
+
+The wizard detects your OS and asks which installation mode you want:
+
+**macOS:**
+```
+  1)  Native              Homebrew + local Postgres + local Ollama
+  2)  Docker + host Ollama    Postgres in Docker, Ollama already on this Mac
+  3)  Full Docker         Everything in containers  (recommended)
+  4)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
+```
+
+**Linux:**
+```
+  1)  Docker + host Ollama    Postgres in Docker, Ollama on this machine
+  2)  Full Docker         Everything in containers  (recommended)
+  3)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
+```
+
+It then:
+- Installs prerequisites (Homebrew packages or Docker images)
+- Pulls `nomic-embed-text` if needed
+- Writes a `.env` file (gitignored) with your vault path and credentials
+- Updates `claude_desktop_config.json` automatically
+
+After the wizard completes, restart Claude Desktop — no further configuration needed.
+
+---
+
+### Manual start (without wizard)
 
 ```bash
 OBSIDIAN_VAULT="/path/to/your/vault" POSTGRES_PASSWORD=obsidian docker compose up -d
 ```
 
-> Use a stronger `POSTGRES_PASSWORD` in production. Docker Compose also reads a `.env` file in the repo root (gitignored) — put the exports there to avoid typing them each time.
+> Docker Compose also reads a `.env` file in the repo root (gitignored).
 
 First run pulls all images and the `nomic-embed-text` model automatically. This starts:
 
