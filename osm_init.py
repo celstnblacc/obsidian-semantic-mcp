@@ -71,9 +71,25 @@ def cmd_exists(name):
     return shutil.which(name) is not None
 
 
+# ── Non-interactive params (set by CLI flags, consumed by prompt_*) ───────────
+
+# Keys: vault, pg_password, mode, persistent, data_dir,
+#       ssh_host, ssh_user, ssh_port, ssh_key, vault_remote
+_PARAMS: dict = {}
+
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-def prompt(question, default=None, choices=None):
+def prompt(question, default=None, choices=None, param_key=None):
+    # Non-interactive: use pre-supplied value from CLI flags
+    if param_key and param_key in _PARAMS:
+        val = str(_PARAMS[param_key])
+        if choices and val not in choices:
+            fail(f"--{param_key.replace('_', '-')} {val!r} is not one of: {', '.join(choices)}")
+            sys.exit(1)
+        info(f"{question}: {_c('1', val)}  (from --{param_key.replace('_', '-')})")
+        return val
+
     hint = f" [{default}]" if default else ""
     if choices:
         hint = f" ({'/'.join(choices)})"
@@ -93,11 +109,18 @@ def prompt(question, default=None, choices=None):
         print("  Please enter a value.")
 
 
-def confirm(question, default="y"):
-    return prompt(question, default=default, choices=["y", "n"]).lower() == "y"
+def confirm(question, default="y", param_key=None):
+    return prompt(question, default=default, choices=["y", "n"], param_key=param_key).lower() == "y"
 
 
 def prompt_vault():
+    if "vault" in _PARAMS:
+        p = Path(_PARAMS["vault"]).expanduser().resolve()
+        if not p.is_dir():
+            fail(f"Vault not found: {p}")
+            sys.exit(1)
+        info(f"Vault: {_c('1', str(p))}  (from --vault)")
+        return str(p)
     existing = os.environ.get("OBSIDIAN_VAULT", "")
     print()
     if existing:
@@ -113,7 +136,8 @@ def prompt_vault():
 
 
 def prompt_pg_password():
-    return prompt("Postgres password (used for the local Docker DB)", default="obsidian")
+    return prompt("Postgres password (used for the local Docker DB)",
+                  default="obsidian", param_key="pg_password")
 
 
 def prompt_persistent_storage(include_ollama=False):
@@ -131,11 +155,12 @@ def prompt_persistent_storage(include_ollama=False):
     print("    Named volume  — managed by Docker; wiped by  docker compose down -v")
     print("    Bind mount    — lives in a local directory; survives  docker compose down -v")
     print()
-    if not confirm("Use a persistent bind mount? (recommended)", default="y"):
+    if not confirm("Use a persistent bind mount? (recommended)", default="y",
+                   param_key="persistent"):
         return None, None
 
     default_dir = str(Path.home() / ".local" / "share" / "obsidian-semantic-mcp")
-    raw = prompt("Local data directory", default=default_dir)
+    raw = prompt("Local data directory", default=default_dir, param_key="data_dir")
     data_dir = Path(raw).expanduser().resolve()
 
     pgdata_path      = str(data_dir / "pgdata")
@@ -243,28 +268,33 @@ def prompt_ssh_credentials():
     Returns (user, host, remote_port, key_path_or_None).
     """
     print()
-    remote_host = prompt("Remote host (IP address or hostname)")
-    remote_port = prompt("Remote Ollama port", default="11434")
-    ssh_user    = prompt("SSH username", default=os.environ.get("USER", "ubuntu"))
-
-    print()
-    print("  SSH authentication:")
-    print("    1)  Private key  (recommended)")
-    print("    2)  Password / SSH agent")
-    auth = prompt("Choose", choices=["1", "2"])
+    remote_host = prompt("Remote host (IP address or hostname)", param_key="ssh_host")
+    remote_port = prompt("Remote Ollama port", default="11434", param_key="ssh_port")
+    ssh_user    = prompt("SSH username", default=os.environ.get("USER", "ubuntu"),
+                         param_key="ssh_user")
 
     key_path = None
-    if auth == "1":
-        default_key = _default_ssh_key()
-        default_fallback = str(Path.home() / ".ssh" / "id_ed25519")
-        raw = prompt("Path to SSH private key", default=default_key or default_fallback)
-        key_path = str(Path(raw).expanduser().resolve())
-        if not Path(key_path).exists():
-            warn(f"Key file not found: {key_path}")
-            if not confirm("Continue anyway?", default="n"):
-                sys.exit(0)
+    if "ssh_key" in _PARAMS:
+        key_path = str(Path(_PARAMS["ssh_key"]).expanduser().resolve())
+        info(f"SSH key: {_c('1', key_path)}  (from --ssh-key)")
     else:
-        info("Using SSH agent or password — you may be prompted by ssh")
+        print()
+        print("  SSH authentication:")
+        print("    1)  Private key  (recommended)")
+        print("    2)  Password / SSH agent")
+        auth = prompt("Choose", choices=["1", "2"])
+
+        if auth == "1":
+            default_key = _default_ssh_key()
+            default_fallback = str(Path.home() / ".ssh" / "id_ed25519")
+            raw = prompt("Path to SSH private key", default=default_key or default_fallback)
+            key_path = str(Path(raw).expanduser().resolve())
+            if not Path(key_path).exists():
+                warn(f"Key file not found: {key_path}")
+                if not confirm("Continue anyway?", default="n"):
+                    sys.exit(0)
+        else:
+            info("Using SSH agent or password — you may be prompted by ssh")
 
     return ssh_user, remote_host, int(remote_port), key_path
 
@@ -542,17 +572,23 @@ def _prompt_vault_location(ssh_user, ssh_host, key_path=None):
     If remote, offer to mount it via sshfs and return the local mount point.
     Returns the local vault path to pass to Docker.
     """
-    print()
-    print("  Where is your Obsidian vault?\n")
-    print("    1)  On this machine  (local path)")
-    print("    2)  On the remote machine  (will mount via sshfs)")
-    loc = prompt("Choose", choices=["1", "2"])
-
-    if loc == "1":
+    # --vault supplied → always local
+    if "vault" in _PARAMS:
         return prompt_vault()
 
+    # --vault-remote supplied → skip the menu and go straight to sshfs
+    if "vault_remote" not in _PARAMS:
+        print()
+        print("  Where is your Obsidian vault?\n")
+        print("    1)  On this machine  (local path)")
+        print("    2)  On the remote machine  (will mount via sshfs)")
+        loc = prompt("Choose", choices=["1", "2"])
+        if loc == "1":
+            return prompt_vault()
+
     # Remote vault via sshfs
-    remote_vault = prompt("Path to vault on remote machine (absolute)")
+    remote_vault = prompt("Path to vault on remote machine (absolute)",
+                          param_key="vault_remote")
     default_mount = str(Path.home() / "obsidian-remote-vault")
     mount_point   = prompt("Local mount point", default=default_mount)
 
@@ -915,7 +951,7 @@ def cmd_init():
         print(f"         {desc}")
     print()
 
-    choice = prompt("Choose", choices=list(modes.keys()))
+    choice = prompt("Choose", choices=list(modes.keys()), param_key="mode")
     _, _, handler = modes[choice]
     handler()
 
@@ -924,22 +960,39 @@ def cmd_init():
 
 def cmd_help():
     print(f"\n  {_c('1', 'osm')} — Obsidian Semantic MCP CLI\n")
-    print(f"  {_c('1', 'Usage:')}  scripts/osm <command> [--dry-run]\n")
+    print(f"  {_c('1', 'Usage:')}  scripts/osm <command> [flags]\n")
     print(f"  {_c('1', 'Commands:')}\n")
     for name, (_, desc) in COMMANDS.items():
         print(f"    {_c('1', f'osm {name:<10}')}  {desc}")
     print()
     print(f"  {_c('1', 'Flags:')}\n")
-    print(f"    {_c('1', '--dry-run')}   Print every action that would run — make no changes")
+    print(f"    {_c('1', '--dry-run')}              Print every action that would run — make no changes")
+    print()
+    print(f"  {_c('1', 'init flags')}  (skip interactive prompts — usable from scripts or AI agents)\n")
+    print(f"    {_c('1', '--mode <1-4>')}          Installation mode (macOS: 1=native 2=docker+host-ollama 3=full-docker 4=remote-ollama)")
+    print(f"    {_c('1', '--vault <path>')}         Absolute path to Obsidian vault")
+    print(f"    {_c('1', '--pg-password <pw>')}     Postgres password  (default: obsidian)")
+    print(f"    {_c('1', '--persistent')}           Use bind-mount volumes for persistent storage")
+    print(f"    {_c('1', '--no-persistent')}        Use named Docker volumes (wiped by down -v)")
+    print(f"    {_c('1', '--data-dir <path>')}      Bind-mount data directory  (implies --persistent)")
+    print(f"    {_c('1', '--ssh-host <host>')}      Remote Ollama host  (mode 4)")
+    print(f"    {_c('1', '--ssh-user <user>')}      SSH username  (mode 4)")
+    print(f"    {_c('1', '--ssh-port <port>')}      Remote Ollama port  (default: 11434, mode 4)")
+    print(f"    {_c('1', '--ssh-key <path>')}       SSH private key path  (mode 4)")
+    print(f"    {_c('1', '--vault-remote <path>')}  Vault path on remote machine — mount via sshfs  (mode 4)")
     print()
     print(f"  {_c('1', 'Examples:')}\n")
-    print(f"    scripts/osm init              # Interactive setup")
-    print(f"    scripts/osm init --dry-run    # Preview setup steps without changes")
-    print(f"    scripts/osm status            # Check service health")
-    print(f"    scripts/osm tunnel            # Reconnect SSH tunnel (remote Ollama)")
-    print(f"    scripts/osm rebuild           # Rebuild Docker images")
-    print(f"    scripts/osm remove            # Stop services, wipe volumes and config")
-    print(f"    scripts/osm remove --dry-run  # Preview what remove would delete")
+    print(f"    scripts/osm init                                    # Interactive setup")
+    print(f"    scripts/osm init --dry-run                          # Preview without changes")
+    print(f"    scripts/osm init --mode 3 --vault /path/to/vault \\")
+    print(f"        --pg-password secret --persistent               # Non-interactive full Docker")
+    print(f"    scripts/osm init --mode 4 --vault /path/to/vault \\")
+    print(f"        --ssh-host 10.0.0.5 --ssh-user ubuntu \\")
+    print(f"        --ssh-key $HOME/.ssh/id_ed25519                 # Remote Ollama via SSH")
+    print(f"    scripts/osm status                                  # Check service health")
+    print(f"    scripts/osm tunnel                                  # Reconnect SSH tunnel")
+    print(f"    scripts/osm rebuild                                 # Rebuild Docker images")
+    print(f"    scripts/osm remove                                  # Stop services and wipe config")
     print()
 
 
@@ -955,15 +1008,68 @@ COMMANDS = {
 }
 
 
-def main():
+_FLAG_MAP = {
+    # flag name (without --) → _PARAMS key
+    "vault":        "vault",
+    "pg-password":  "pg_password",
+    "mode":         "mode",
+    "persistent":   "persistent",   # boolean, value "y"
+    "no-persistent":"persistent",   # boolean, value "n"
+    "data-dir":     "data_dir",
+    "ssh-host":     "ssh_host",
+    "ssh-user":     "ssh_user",
+    "ssh-port":     "ssh_port",
+    "ssh-key":      "ssh_key",
+    "vault-remote": "vault_remote",
+}
+
+
+def _parse_flags(args):
+    """
+    Pull --key=value / --key value / boolean --flag pairs out of args.
+    Returns (remaining_args, params_dict).
+    """
     global DRY_RUN
+    params = {}
+    remaining = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--dry-run":
+            DRY_RUN = True
+            i += 1
+            continue
+        if a == "--persistent":
+            params["persistent"] = "y"
+            i += 1
+            continue
+        if a == "--no-persistent":
+            params["persistent"] = "n"
+            i += 1
+            continue
+        if a.startswith("--"):
+            key = a[2:]
+            if "=" in key:
+                k, v = key.split("=", 1)
+                if k in _FLAG_MAP:
+                    params[_FLAG_MAP[k]] = v
+                    i += 1
+                    continue
+            elif key in _FLAG_MAP and i + 1 < len(args) and not args[i + 1].startswith("--"):
+                params[_FLAG_MAP[key]] = args[i + 1]
+                i += 2
+                continue
+        remaining.append(a)
+        i += 1
+    return remaining, params
 
-    args = sys.argv[1:]
 
-    # Strip --dry-run from args and activate dry-run mode
-    if "--dry-run" in args:
-        DRY_RUN = True
-        args = [a for a in args if a != "--dry-run"]
+def main():
+    global DRY_RUN, _PARAMS
+
+    args, _PARAMS = _parse_flags(sys.argv[1:])
+
+    if DRY_RUN:
         info("Dry-run mode — no changes will be made")
         print()
 
