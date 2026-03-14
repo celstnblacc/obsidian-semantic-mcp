@@ -391,7 +391,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = http.server.HTTPServer(("127.0.0.1", DASH_PORT), DashboardHandler)
+    server = http.server.HTTPServer(("0.0.0.0", DASH_PORT), DashboardHandler)
     print(f"Dashboard running at http://localhost:{DASH_PORT}")
     print(f"Vault: {VAULT_PATH or '(not set)'}")
     print(f"Database: {DATABASE_URL}")

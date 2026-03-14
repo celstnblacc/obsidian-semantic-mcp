@@ -572,7 +572,8 @@ def mode_full_docker():
               pgdata_path=pgdata_path, ollama_data_path=ollama_data_path)
 
     header("Starting all services")
-    env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw}
+    env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw,
+           "OLLAMA_URL": "http://ollama:11434", "COMPOSE_PROFILES": "full-docker"}
     if pgdata_path:
         env["PGDATA_PATH"] = pgdata_path
     if ollama_data_path:

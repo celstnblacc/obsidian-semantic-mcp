@@ -21,6 +21,7 @@ services:
 
   ollama:
     image: ollama/ollama:latest
+    profiles: [full-docker]
     restart: unless-stopped
     volumes:
       # OLLAMA_DATA_PATH: set to an absolute host path for a persistent bind mount,
@@ -37,6 +38,7 @@ services:
   # One-shot container to pull the embedding model if missing
   ollama-pull:
     image: ollama/ollama:latest
+    profiles: [full-docker]
     depends_on:
       ollama:
         condition: service_healthy
@@ -51,8 +53,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
     environment:
       OBSIDIAN_VAULT: /vault
       POSTGRES_HOST: postgres
@@ -60,7 +60,7 @@ services:
       POSTGRES_DB: obsidian_brain
       POSTGRES_USER: obsidian
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      OLLAMA_URL: http://ollama:11434
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       EMBEDDING_MODEL: nomic-embed-text
     volumes:
       - ${OBSIDIAN_VAULT:-.}:/vault:ro
@@ -73,8 +73,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
     command: ["python3", "src/dashboard.py"]
     environment:
       OBSIDIAN_VAULT: /vault
@@ -83,7 +81,7 @@ services:
       POSTGRES_DB: obsidian_brain
       POSTGRES_USER: obsidian
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      OLLAMA_URL: http://ollama:11434
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       EMBEDDING_MODEL: nomic-embed-text
       DASHBOARD_PORT: "8484"
     volumes:
