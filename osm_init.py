@@ -738,6 +738,77 @@ def cmd_rebuild():
     info("Dashboard:  http://localhost:8484")
 
 
+# ── Remove command ────────────────────────────────────────────────────────────
+
+def cmd_remove():
+    header("OSM Remove — tear down Obsidian Semantic MCP")
+    hr()
+    print()
+    warn("This will:")
+    print("    • Stop and remove all Docker containers and volumes  (all indexed embeddings lost)")
+    print("    • Delete .env from this project")
+    print("    • Remove obsidian-semantic from claude_desktop_config.json")
+    print()
+
+    if not DRY_RUN and not confirm("Continue?", default="n"):
+        info("Aborted — nothing changed")
+        return
+
+    # ── Docker services + volumes ─────────────────────────────────────────────
+    header("Stopping Docker services")
+    r = run(
+        f"docker compose --project-directory {PROJECT_ROOT} ps -q",
+        check=False, capture=True,
+    )
+    if not DRY_RUN and not (r.stdout or "").strip():
+        info("No running Docker services found — skipping")
+    else:
+        run(f"docker compose --project-directory {PROJECT_ROOT} down -v", check=False)
+        if not DRY_RUN:
+            ok("Docker services stopped and volumes removed")
+
+    # ── .env ──────────────────────────────────────────────────────────────────
+    header("Removing .env")
+    env_path = PROJECT_ROOT / ".env"
+    if DRY_RUN:
+        _dry(f"delete {env_path}")
+    elif env_path.exists():
+        env_path.unlink()
+        ok(f"Deleted {env_path}")
+    else:
+        info(".env not found — skipping")
+
+    # ── Claude Desktop config ─────────────────────────────────────────────────
+    header("Updating Claude Desktop config")
+    cfg_path = _claude_cfg_path()
+    if not cfg_path:
+        warn("Unknown platform — remove obsidian-semantic from claude_desktop_config.json manually")
+    elif DRY_RUN:
+        _dry(f"remove obsidian-semantic entry from {cfg_path}")
+    elif cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            servers = cfg.get("mcpServers", {})
+            if "obsidian-semantic" in servers:
+                del servers["obsidian-semantic"]
+                cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+                ok(f"Removed obsidian-semantic from {cfg_path}")
+                info("Restart Claude Desktop to apply")
+            else:
+                info("obsidian-semantic not found in config — skipping")
+        except json.JSONDecodeError:
+            warn(f"Could not parse {cfg_path} — remove entry manually")
+    else:
+        info("Claude Desktop config not found — skipping")
+
+    if not DRY_RUN:
+        print()
+        hr()
+        ok(_c("1", "Removed."))
+        info("Run  scripts/osm init  to reinstall")
+        hr()
+
+
 # ── Install mode tables ───────────────────────────────────────────────────────
 
 MODES_MACOS = {
@@ -812,6 +883,8 @@ def cmd_help():
     print(f"    scripts/osm status            # Check service health")
     print(f"    scripts/osm tunnel            # Reconnect SSH tunnel (remote Ollama)")
     print(f"    scripts/osm rebuild           # Rebuild Docker images")
+    print(f"    scripts/osm remove            # Stop services, wipe volumes and config")
+    print(f"    scripts/osm remove --dry-run  # Preview what remove would delete")
     print()
 
 
@@ -822,6 +895,7 @@ COMMANDS = {
     "status":  (cmd_status,  "Check service health"),
     "tunnel":  (cmd_tunnel,  "Reconnect SSH tunnel to remote Ollama host"),
     "rebuild": (cmd_rebuild, "Rebuild Docker images and restart"),
+    "remove":  (cmd_remove,  "Stop services, delete volumes and config"),
     "help":    (cmd_help,    "Show this help message"),
 }
 
