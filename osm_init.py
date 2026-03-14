@@ -354,6 +354,38 @@ def write_env(vault, pg_password, ollama_url, ssh_params=None,
     ok(f"Wrote {env_path}")
 
 
+# ── Claude Code CLI registration ──────────────────────────────────────────────
+
+def register_claude_cli(entry):
+    """
+    Register the MCP server with Claude Code CLI via `claude mcp add --scope user`.
+
+    This writes to $HOME/.claude.json (separate from claude_desktop_config.json).
+    Silently skips if the `claude` CLI is not installed.
+    """
+    if not cmd_exists("claude"):
+        return  # Claude Code CLI not installed — Desktop config is enough
+
+    cmd_args = entry.get("args", [])
+    env_pairs = [f"{k}={v}" for k, v in entry.get("env", {}).items()]
+
+    cli_cmd = ["claude", "mcp", "add", "--scope", "user"]
+    for pair in env_pairs:
+        cli_cmd += ["-e", pair]
+    cli_cmd += ["obsidian-semantic", "--", entry["command"]] + cmd_args
+
+    if DRY_RUN:
+        _dry(" ".join(str(a) for a in cli_cmd))
+        return
+
+    r = run(cli_cmd, check=False)
+    if r.returncode == 0:
+        ok("Claude Code CLI: obsidian-semantic registered  (claude mcp list to verify)")
+    else:
+        warn("claude mcp add failed — add manually:")
+        info(f"  {' '.join(str(a) for a in cli_cmd)}")
+
+
 # ── Claude Desktop config ─────────────────────────────────────────────────────
 
 def _claude_cfg_path():
@@ -508,9 +540,11 @@ def mode_native_macos():
     run(["uv", "sync", "--project", str(PROJECT_ROOT)])
     ok("Dependencies installed in .venv")
 
-    # ── Claude Desktop config ─────────────────────────────────────────────────
+    # ── Claude Desktop + CLI config ───────────────────────────────────────────
     header("Claude Desktop configuration")
-    update_claude_config(_native_entry(vault, db_url))
+    entry = _native_entry(vault, db_url)
+    update_claude_config(entry)
+    register_claude_cli(entry)
 
     _done_native(vault)
 
@@ -538,7 +572,9 @@ def mode_full_docker():
     wait_for_postgres()
 
     header("Claude Desktop configuration")
-    update_claude_config(_docker_entry())
+    entry = _docker_entry()
+    update_claude_config(entry)
+    register_claude_cli(entry)
     _done_docker()
 
 
@@ -573,7 +609,9 @@ def mode_docker_host_ollama():
     wait_for_postgres()
 
     header("Claude Desktop configuration")
-    update_claude_config(_docker_entry())
+    entry = _docker_entry()
+    update_claude_config(entry)
+    register_claude_cli(entry)
     _done_docker()
 
 
@@ -693,13 +731,16 @@ def mode_docker_remote_ollama():
     wait_for_postgres()
 
     header("Claude Desktop configuration")
-    update_claude_config(_docker_entry())
+    entry = _docker_entry()
+    update_claude_config(entry)
+    register_claude_cli(entry)
     _done_docker_remote(ssh_user, remote_host, remote_port, local_tunnel_port, key_path)
 
 
 # ── Summary printers ──────────────────────────────────────────────────────────
 
 def _done_docker_remote(ssh_user, ssh_host, remote_port, local_port, key_path):
+    _link_osm_to_path()
     key_flag = f" -i {key_path}" if key_path else ""
     tunnel_cmd = (
         f"ssh -N -f -o ExitOnForwardFailure=yes "
@@ -717,7 +758,7 @@ def _done_docker_remote(ssh_user, ssh_host, remote_port, local_port, key_path):
     print(f"  {_c('93', '⚠')}  The SSH tunnel must be running for Ollama to work.")
     print(f"     Reconnect with:")
     print(f"\n       {_c('1', tunnel_cmd)}\n")
-    info("Or run:  scripts/osm tunnel   (reads .env automatically)")
+    info("Or run:  osm tunnel   (reads .env automatically)")
     hr()
 
 
@@ -737,24 +778,55 @@ def _done_dry_run():
     hr()
 
 
+def _link_osm_to_path():
+    """
+    Symlink scripts/osm into $HOME/.local/bin so `osm` is available globally.
+    Silently skips if the link already exists and points to the same target.
+    """
+    bin_dir = Path.home() / ".local" / "bin"
+    target  = PROJECT_ROOT / "scripts" / "osm"
+    link    = bin_dir / "osm"
+
+    if DRY_RUN:
+        _dry(f"ln -sf {target} {link}")
+        return
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() and link.resolve() == target.resolve():
+        return  # already correct
+    try:
+        link.unlink(missing_ok=True)
+        link.symlink_to(target)
+        target.chmod(0o755)
+        ok(f"Linked: {link}  →  osm is now globally available")
+        # PATH hint if $HOME/.local/bin is not in PATH
+        if str(bin_dir) not in os.environ.get("PATH", ""):
+            warn(f"{bin_dir} is not in your PATH — add to your shell profile:")
+            info(f'  export PATH="{bin_dir}:$PATH"')
+    except OSError as exc:
+        warn(f"Could not symlink osm: {exc}")
+
+
 def _done_native(vault):
+    _link_osm_to_path()
     print()
     hr()
     ok(_c("1", "Setup complete!"))
     print()
     info(f"Vault: {vault}")
-    info("Restart Claude Desktop — server starts automatically")
+    info("Restart Claude Desktop / Claude Code to activate the MCP server")
     hr()
 
 
 def _done_docker():
+    _link_osm_to_path()
     print()
     hr()
     ok(_c("1", "Setup complete!"))
     print()
     info("Dashboard:  http://localhost:8484")
     info("Logs:       docker compose logs -f mcp-server")
-    info("Restart Claude Desktop — server starts automatically")
+    info("Restart Claude Desktop / Claude Code to activate the MCP server")
     hr()
 
 
@@ -908,7 +980,7 @@ def cmd_remove():
         print()
         hr()
         ok(_c("1", "Removed."))
-        info("Run  scripts/osm init  to reinstall")
+        info("Run  osm init  to reinstall")
         hr()
 
 
@@ -970,9 +1042,14 @@ def cmd_init():
 
 # ── Help command ──────────────────────────────────────────────────────────────
 
+_INSTALL_URL = "https://raw.githubusercontent.com/celstnblacc/obsidian-semantic-mcp/main/install.sh"
+
+
 def cmd_help():
     print(f"\n  {_c('1', 'osm')} — Obsidian Semantic MCP CLI\n")
-    print(f"  {_c('1', 'Usage:')}  scripts/osm <command> [flags]\n")
+    print(f"  {_c('1', 'Install (one-liner):')}\n")
+    print(f"    curl -fsSL {_INSTALL_URL} | bash\n")
+    print(f"  {_c('1', 'Usage:')}  osm <command> [flags]\n")
     print(f"  {_c('1', 'Commands:')}\n")
     for name, (_, desc) in COMMANDS.items():
         print(f"    {_c('1', f'osm {name:<10}')}  {desc}")
@@ -994,17 +1071,17 @@ def cmd_help():
     print(f"    {_c('1', '--vault-remote <path>')}  Vault path on remote machine — mount via sshfs  (mode 4)")
     print()
     print(f"  {_c('1', 'Examples:')}\n")
-    print(f"    scripts/osm init                                    # Interactive setup")
-    print(f"    scripts/osm init --dry-run                          # Preview without changes")
-    print(f"    scripts/osm init --mode 3 --vault /path/to/vault \\")
-    print(f"        --pg-password secret --persistent               # Non-interactive full Docker")
-    print(f"    scripts/osm init --mode 4 --vault /path/to/vault \\")
+    print(f"    osm init                                    # Interactive setup")
+    print(f"    osm init --dry-run                          # Preview without changes")
+    print(f"    osm init --mode 3 --vault /path/to/vault \\")
+    print(f"        --pg-password secret --persistent       # Non-interactive full Docker")
+    print(f"    osm init --mode 4 --vault /path/to/vault \\")
     print(f"        --ssh-host 203.0.113.5 --ssh-user ubuntu \\")
-    print(f"        --ssh-key $HOME/.ssh/id_ed25519                 # Remote Ollama via SSH")
-    print(f"    scripts/osm status                                  # Check service health")
-    print(f"    scripts/osm tunnel                                  # Reconnect SSH tunnel")
-    print(f"    scripts/osm rebuild                                 # Rebuild Docker images")
-    print(f"    scripts/osm remove                                  # Stop services and wipe config")
+    print(f"        --ssh-key $HOME/.ssh/id_ed25519         # Remote Ollama via SSH")
+    print(f"    osm status                                  # Check service health")
+    print(f"    osm tunnel                                  # Reconnect SSH tunnel")
+    print(f"    osm rebuild                                 # Rebuild Docker images")
+    print(f"    osm remove                                  # Stop services and wipe config")
     print()
 
 
