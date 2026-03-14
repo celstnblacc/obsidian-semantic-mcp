@@ -137,6 +137,7 @@ class TestIsSystemPath:
 class TestIndexingFlag:
     def test_search_returns_indexing_message_when_in_progress(self, monkeypatch):
         """search_vault with empty DB during indexing must say indexing is in progress, not 'try reindex_vault'."""
+        from contextlib import contextmanager
         import server
         monkeypatch.setattr(server, "_INDEXING_IN_PROGRESS", True)
 
@@ -150,7 +151,12 @@ class TestIndexingFlag:
         mock_conn.__enter__ = lambda s: s
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_conn.cursor.return_value = mock_cur
-        monkeypatch.setattr(server, "get_conn", lambda: mock_conn)
+
+        @contextmanager
+        def fake_db_conn():
+            yield mock_conn
+
+        monkeypatch.setattr(server, "db_conn", fake_db_conn)
         monkeypatch.setattr(server, "embed", lambda q: [0.1, 0.2])
 
         result = asyncio.run(server.call_tool("search_vault", {"query": "anything"}))

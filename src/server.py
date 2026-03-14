@@ -14,16 +14,23 @@ Stack:
 
 Environment variables:
   OBSIDIAN_VAULT    absolute path to your vault (required)
-  DATABASE_URL      postgres connection string  (default: postgresql://localhost/obsidian_brain)
+  DATABASE_URL      postgres connection string  (overrides POSTGRES_* vars)
+  POSTGRES_HOST     postgres host               (default: localhost)
+  POSTGRES_PORT     postgres port               (default: 5432)
+  POSTGRES_DB       postgres database           (default: obsidian_brain)
+  POSTGRES_USER     postgres user               (default: obsidian)
+  POSTGRES_PASSWORD postgres password           (default: empty)
   OLLAMA_URL        ollama API endpoint         (default: http://localhost:11434)
   EMBEDDING_MODEL   ollama model name           (default: nomic-embed-text)
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -31,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg2
+import psycopg2.pool
 import requests
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -63,7 +71,8 @@ def _build_dsn() -> str:
 DATABASE_URL = _build_dsn()
 
 MAX_EMBED_CHARS = 2000  # nomic-embed-text context limit (approx 512 tokens)
-_TIMESTAMP_FMT = "%Y-%m-%d %H:%M"
+_TIMESTAMP_FMT  = "%Y-%m-%d %H:%M"
+_DEBOUNCE_SECS  = 0.5   # collapse rapid saves from Obsidian autosave
 
 # Set True during background_init so search_vault can return a useful message
 # instead of the misleading "No indexed notes found. Try running reindex_vault."
@@ -79,14 +88,36 @@ log = logging.getLogger(__name__)
 
 # ──────────────────────────────── Database ───────────────────────────────────
 
-def get_conn():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+# Watcher observer — held here so the shutdown handler can stop it cleanly.
+_observer: Observer | None = None
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """Return the shared connection pool, initialising it on first call."""
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, DATABASE_URL)
+    return _pool
+
+
+@contextlib.contextmanager
+def db_conn():
+    """Acquire a connection from the pool and return it on exit."""
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        pool.putconn(conn)
 
 
 def init_db():
-    conn = get_conn()
-    try:
+    with db_conn() as conn:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
@@ -106,8 +137,6 @@ def init_db():
                     ON notes USING ivfflat (embedding vector_cosine_ops)
                     WITH (lists = 100);
                 """)
-    finally:
-        conn.close()
     log.info("Database initialised")
 
 
@@ -154,8 +183,7 @@ def _is_system_path(path: Path) -> bool:
 def index_note(path: str, content: str):
     """Embed a single note and upsert into the database. Skips unchanged files."""
     h = file_hash(content)
-    conn = get_conn()
-    try:
+    with db_conn() as conn:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT hash FROM notes WHERE path = %s", (path,))
@@ -173,19 +201,14 @@ def index_note(path: str, content: str):
                             embedding  = EXCLUDED.embedding,
                             indexed_at = NOW()
                 """, (path, content, h, _vec_to_str(vec)))
-    finally:
-        conn.close()
     log.info("Indexed: %s", path)
 
 
 def delete_note(path: str):
-    conn = get_conn()
-    try:
+    with db_conn() as conn:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM notes WHERE path = %s", (path,))
-    finally:
-        conn.close()
     log.info("Removed: %s", path)
 
 
@@ -204,13 +227,10 @@ def index_vault(vault: str):
     # Rebuild IVFFlat index now that data exists — an index built on an empty
     # table has no list centroids and returns zero results.
     try:
-        conn = get_conn()
-        try:
+        with db_conn() as conn:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute("REINDEX INDEX notes_embedding_idx;")
-        finally:
-            conn.close()
         log.info("Rebuilt IVFFlat index")
     except Exception as e:
         log.warning("Index rebuild skipped: %s", e)
@@ -222,7 +242,24 @@ def index_vault(vault: str):
 
 class VaultEventHandler(FileSystemEventHandler):
 
+    def __init__(self):
+        super().__init__()
+        self._timers: dict[str, threading.Timer] = {}
+        self._lock = threading.Lock()
+
+    def _schedule(self, path: str):
+        """Debounce rapid events for the same path (e.g. Obsidian autosave)."""
+        with self._lock:
+            existing = self._timers.pop(path, None)
+            if existing:
+                existing.cancel()
+            t = threading.Timer(_DEBOUNCE_SECS, self._handle_upsert, args=(path,))
+            self._timers[path] = t
+            t.start()
+
     def _handle_upsert(self, path: str):
+        with self._lock:
+            self._timers.pop(path, None)
         if not path.endswith(".md") or _is_system_path(Path(path)):
             return
         try:
@@ -235,11 +272,11 @@ class VaultEventHandler(FileSystemEventHandler):
 
     def on_created(self, event):
         if not event.is_directory:
-            self._handle_upsert(event.src_path)
+            self._schedule(event.src_path)
 
     def on_modified(self, event):
         if not event.is_directory:
-            self._handle_upsert(event.src_path)
+            self._schedule(event.src_path)
 
     def on_deleted(self, event):
         if not event.is_directory and event.src_path.endswith(".md"):
@@ -249,15 +286,16 @@ class VaultEventHandler(FileSystemEventHandler):
         if not event.is_directory:
             if event.src_path.endswith(".md"):
                 delete_note(event.src_path)
-            self._handle_upsert(event.dest_path)
+            self._schedule(event.dest_path)
 
 
-def start_watcher(vault: str):
-    observer = Observer()
-    observer.schedule(VaultEventHandler(), vault, recursive=True)
-    observer.start()
+def start_watcher(vault: str) -> Observer:
+    global _observer
+    _observer = Observer()
+    _observer.schedule(VaultEventHandler(), vault, recursive=True)
+    _observer.start()
     log.info("Watching vault: %s", vault)
-    return observer
+    return _observer
 
 
 # ──────────────────────────── Background Init ────────────────────────────────
@@ -275,6 +313,19 @@ def background_init(vault: str):
         log.error("Background init failed: %s", e)
     finally:
         _INDEXING_IN_PROGRESS = False
+
+
+# ─────────────────────────── Shutdown Handler ────────────────────────────────
+
+def _shutdown(signum, _frame):
+    """Stop the watcher and close the DB pool before exiting."""
+    log.info("Shutting down (signal %d)…", signum)
+    if _observer is not None:
+        _observer.stop()
+        _observer.join(timeout=5)
+    if _pool is not None:
+        _pool.closeall()
+    sys.exit(0)
 
 
 # ──────────────────────────── Vault Filesystem Helpers ───────────────────────
@@ -494,8 +545,7 @@ async def call_tool(name: str, arguments: dict):
             vec = await loop.run_in_executor(None, embed, query)
             vec_str = _vec_to_str(vec)
 
-            conn = get_conn()
-            try:
+            with db_conn() as conn:
                 with conn:
                     with conn.cursor() as cur:
                         cur.execute("""
@@ -506,8 +556,6 @@ async def call_tool(name: str, arguments: dict):
                             LIMIT %s
                         """, (vec_str, vec_str, limit))
                         rows = cur.fetchall()
-            finally:
-                conn.close()
 
             if not rows:
                 if _INDEXING_IN_PROGRESS:
@@ -538,8 +586,7 @@ async def call_tool(name: str, arguments: dict):
     # ── list_indexed_notes ────────────────────────────────────────────────────
     elif name == "list_indexed_notes":
         try:
-            conn = get_conn()
-            try:
+            with db_conn() as conn:
                 with conn:
                     with conn.cursor() as cur:
                         cur.execute("""
@@ -548,8 +595,6 @@ async def call_tool(name: str, arguments: dict):
                             ORDER BY indexed_at DESC
                         """)
                         rows = cur.fetchall()
-            finally:
-                conn.close()
 
             if not rows:
                 return [TextContent(
@@ -759,6 +804,9 @@ async def main():
     if not VAULT_PATH:
         log.error("OBSIDIAN_VAULT is not set. Export it before running.")
         sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     # Full index + watcher starts in background — server is immediately ready
     threading.Thread(
