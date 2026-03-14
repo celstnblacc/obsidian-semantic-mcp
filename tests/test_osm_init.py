@@ -1,0 +1,246 @@
+"""
+Unit tests for osm_init.py — no subprocess calls, no real filesystem writes
+(except write_env real-write tests which use tmp_path).
+"""
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import osm_init
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _reset():
+    """Reset global mutable state between tests."""
+    osm_init.DRY_RUN = False
+    osm_init._DRY_ACTIONS.clear()
+    osm_init._PARAMS.clear()
+
+
+# ── _parse_flags ──────────────────────────────────────────────────────────────
+
+class TestParseFlags:
+    def setup_method(self):
+        _reset()
+
+    def teardown_method(self):
+        _reset()
+
+    def test_dry_run_sets_global(self):
+        """--dry-run must flip the DRY_RUN global and be stripped from remaining args."""
+        remaining, _ = osm_init._parse_flags(["init", "--dry-run"])
+        assert osm_init.DRY_RUN is True
+        assert remaining == ["init"]
+
+    def test_key_equals_value(self):
+        """--vault=/tmp/vault syntax."""
+        _, params = osm_init._parse_flags(["--vault=/tmp/vault"])
+        assert params["vault"] == "/tmp/vault"
+
+    def test_key_space_value(self):
+        """--vault /tmp/vault syntax."""
+        _, params = osm_init._parse_flags(["--vault", "/tmp/vault"])
+        assert params["vault"] == "/tmp/vault"
+
+    def test_persistent_stores_y(self):
+        _, params = osm_init._parse_flags(["--persistent"])
+        assert params["persistent"] == "y"
+
+    def test_no_persistent_stores_n(self):
+        _, params = osm_init._parse_flags(["--no-persistent"])
+        assert params["persistent"] == "n"
+
+    def test_mode_flag(self):
+        _, params = osm_init._parse_flags(["init", "--mode", "3"])
+        assert params["mode"] == "3"
+
+    def test_pg_password_flag(self):
+        _, params = osm_init._parse_flags(["--pg-password", "secret"])
+        assert params["pg_password"] == "secret"
+
+    def test_ssh_flags(self):
+        _, params = osm_init._parse_flags([
+            "--ssh-host", "10.0.0.5",
+            "--ssh-user", "ubuntu",
+            "--ssh-port", "11434",
+            "--ssh-key",  "/path/to/key",
+        ])
+        assert params["ssh_host"] == "10.0.0.5"
+        assert params["ssh_user"] == "ubuntu"
+        assert params["ssh_port"] == "11434"
+        assert params["ssh_key"]  == "/path/to/key"
+
+    def test_unknown_flag_passes_through(self):
+        """Unrecognised flags are left in remaining args — not silently swallowed."""
+        remaining, params = osm_init._parse_flags(["init", "--unknown-flag"])
+        assert "--unknown-flag" in remaining
+        assert params == {}
+
+    def test_multiple_flags_combined(self):
+        _, params = osm_init._parse_flags([
+            "init",
+            "--mode=3",
+            "--vault", "/tmp/vault",
+            "--pg-password", "pw",
+            "--persistent",
+        ])
+        assert params["mode"]        == "3"
+        assert params["vault"]       == "/tmp/vault"
+        assert params["pg_password"] == "pw"
+        assert params["persistent"]  == "y"
+
+    def test_non_flag_args_preserved(self):
+        """Positional args must survive flag stripping unchanged."""
+        remaining, _ = osm_init._parse_flags(["init", "--mode", "3", "extra"])
+        assert "init"  in remaining
+        assert "extra" in remaining
+
+    def test_data_dir_flag(self):
+        _, params = osm_init._parse_flags(["--data-dir", "/data/pg"])
+        assert params["data_dir"] == "/data/pg"
+
+    def test_vault_remote_flag(self):
+        _, params = osm_init._parse_flags(["--vault-remote", "/remote/vault"])
+        assert params["vault_remote"] == "/remote/vault"
+
+
+# ── _read_env ─────────────────────────────────────────────────────────────────
+
+class TestReadEnv:
+    def _with_root(self, tmp_path, content, fn):
+        (tmp_path / ".env").write_text(content)
+        original = osm_init.PROJECT_ROOT
+        osm_init.PROJECT_ROOT = tmp_path
+        try:
+            return fn()
+        finally:
+            osm_init.PROJECT_ROOT = original
+
+    def test_parses_key_value(self, tmp_path):
+        result = self._with_root(tmp_path, "FOO=bar\nBAZ=qux\n", osm_init._read_env)
+        assert result["FOO"] == "bar"
+        assert result["BAZ"] == "qux"
+
+    def test_ignores_comment_lines(self, tmp_path):
+        result = self._with_root(tmp_path, "# comment\nKEY=value\n", osm_init._read_env)
+        assert "# comment" not in result
+        assert result["KEY"] == "value"
+
+    def test_ignores_blank_lines(self, tmp_path):
+        result = self._with_root(tmp_path, "\nKEY=value\n\n", osm_init._read_env)
+        assert "" not in result
+        assert result["KEY"] == "value"
+
+    def test_returns_empty_when_file_missing(self, tmp_path):
+        original = osm_init.PROJECT_ROOT
+        osm_init.PROJECT_ROOT = tmp_path
+        try:
+            result = osm_init._read_env()
+        finally:
+            osm_init.PROJECT_ROOT = original
+        assert result == {}
+
+    def test_value_with_equals_sign(self, tmp_path):
+        """Values containing '=' must be preserved correctly."""
+        result = self._with_root(tmp_path, "URL=http://host/path?a=1\n", osm_init._read_env)
+        assert result["URL"] == "http://host/path?a=1"
+
+
+# ── write_env ─────────────────────────────────────────────────────────────────
+
+class TestWriteEnv:
+    def setup_method(self):
+        _reset()
+
+    def teardown_method(self):
+        _reset()
+
+    def _call(self, tmp_path, **kwargs):
+        original = osm_init.PROJECT_ROOT
+        osm_init.PROJECT_ROOT = tmp_path
+        try:
+            osm_init.write_env("/vault", "pw", "http://ollama:11434", **kwargs)
+        finally:
+            osm_init.PROJECT_ROOT = original
+
+    def test_writes_file(self, tmp_path):
+        self._call(tmp_path)
+        content = (tmp_path / ".env").read_text()
+        assert "OBSIDIAN_VAULT=/vault" in content
+        assert "POSTGRES_PASSWORD=pw"  in content
+        assert "OLLAMA_URL=http://ollama:11434" in content
+
+    def test_includes_pgdata_path(self, tmp_path):
+        self._call(tmp_path, pgdata_path="/data/pgdata")
+        assert "PGDATA_PATH=/data/pgdata" in (tmp_path / ".env").read_text()
+
+    def test_includes_ollama_data_path(self, tmp_path):
+        self._call(tmp_path, ollama_data_path="/data/ollama")
+        assert "OLLAMA_DATA_PATH=/data/ollama" in (tmp_path / ".env").read_text()
+
+    def test_includes_ssh_params(self, tmp_path):
+        self._call(tmp_path, ssh_params={
+            "user": "bob", "host": "myserver",
+            "remote_port": 11434, "local_port": 11435,
+        })
+        content = (tmp_path / ".env").read_text()
+        assert "OSM_SSH_USER=bob"    in content
+        assert "OSM_SSH_HOST=myserver" in content
+        assert "OSM_SSH_REMOTE_PORT=11434" in content
+        assert "OSM_SSH_LOCAL_PORT=11435"  in content
+
+    def test_ssh_key_written_when_present(self, tmp_path):
+        self._call(tmp_path, ssh_params={
+            "user": "u", "host": "h",
+            "remote_port": 11434, "local_port": 11435,
+            "key_path": "/path/to/key",
+        })
+        assert "OSM_SSH_KEY=/path/to/key" in (tmp_path / ".env").read_text()
+
+    def test_dry_run_does_not_write(self, tmp_path):
+        """In dry-run mode the .env file must not be created."""
+        osm_init.DRY_RUN = True
+        self._call(tmp_path)
+        assert not (tmp_path / ".env").exists()
+
+    def test_dry_run_records_action(self, tmp_path):
+        osm_init.DRY_RUN = True
+        self._call(tmp_path)
+        assert any(".env" in a for a in osm_init._DRY_ACTIONS)
+
+
+# ── _default_ssh_key ──────────────────────────────────────────────────────────
+
+class TestDefaultSshKey:
+    def test_returns_empty_when_no_keys_exist(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        assert osm_init._default_ssh_key() == ""
+
+    def test_returns_first_existing_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        key = ssh_dir / "id_ed25519"
+        key.touch()
+        assert osm_init._default_ssh_key() == str(key)
+
+    def test_prefers_ed25519_over_rsa(self, tmp_path, monkeypatch):
+        """id_ed25519 appears first in the candidate list and must win."""
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "id_ed25519").touch()
+        (ssh_dir / "id_rsa").touch()
+        assert "id_ed25519" in osm_init._default_ssh_key()
+
+    def test_falls_back_to_rsa_when_ed25519_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        (ssh_dir / "id_rsa").touch()
+        assert "id_rsa" in osm_init._default_ssh_key()

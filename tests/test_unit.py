@@ -177,3 +177,81 @@ class TestVecToStr:
         import server
         with pytest.raises(ValueError):
             server._vec_to_str([])
+
+
+# ── _build_dsn ────────────────────────────────────────────────────────────────
+
+class TestBuildDsn:
+    def test_prefers_database_url(self, monkeypatch):
+        """DATABASE_URL env var takes priority over POSTGRES_* vars."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://custom/db")
+        import server
+        assert server._build_dsn() == "postgresql://custom/db"
+
+    def test_falls_back_to_postgres_vars(self, monkeypatch):
+        """When DATABASE_URL is absent, assembles DSN from POSTGRES_* vars."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setenv("POSTGRES_HOST", "myhost")
+        monkeypatch.setenv("POSTGRES_PORT", "5433")
+        monkeypatch.setenv("POSTGRES_DB",   "mydb")
+        monkeypatch.setenv("POSTGRES_USER", "myuser")
+        monkeypatch.setenv("POSTGRES_PASSWORD", "mypass")
+        import server
+        dsn = server._build_dsn()
+        assert "host=myhost" in dsn
+        assert "port=5433" in dsn
+        assert "dbname=mydb" in dsn
+        assert "user=myuser" in dsn
+        assert "password=mypass" in dsn
+
+    def test_fallback_dsn_has_no_credential_url(self, monkeypatch):
+        """The libpq keyword format must never produce a postgresql://user:pass@host URL."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        import server
+        assert "://" not in server._build_dsn()
+
+
+# ── _resolve_vault_path ───────────────────────────────────────────────────────
+
+class TestResolveVaultPath:
+    def test_allows_nested_path(self, tmp_path):
+        import server
+        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+            result = server._resolve_vault_path("notes/note.md")
+            assert str(result).startswith(str(tmp_path.resolve()))
+
+    def test_blocks_dotdot_traversal(self, tmp_path):
+        """../../etc/passwd must raise ValueError."""
+        import server
+        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+            with pytest.raises(ValueError, match="escapes vault"):
+                server._resolve_vault_path("../../etc/passwd")
+
+    def test_blocks_absolute_path(self, tmp_path):
+        """/etc/passwd must raise ValueError — absolute paths escape the vault."""
+        import server
+        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+            with pytest.raises(ValueError, match="escapes vault"):
+                server._resolve_vault_path("/etc/passwd")
+
+    def test_vault_root_itself_is_allowed(self, tmp_path):
+        import server
+        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+            result = server._resolve_vault_path(".")
+            assert result == tmp_path.resolve()
+
+
+# ── file_hash ─────────────────────────────────────────────────────────────────
+
+class TestFileHash:
+    def test_deterministic(self):
+        import server
+        assert server.file_hash("hello world") == server.file_hash("hello world")
+
+    def test_different_inputs_differ(self):
+        import server
+        assert server.file_hash("hello") != server.file_hash("world")
+
+    def test_returns_string(self):
+        import server
+        assert isinstance(server.file_hash("x"), str)
