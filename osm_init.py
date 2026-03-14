@@ -136,18 +136,113 @@ def check_ollama_at(host, port=11434):
         return False
 
 
+# ── SSH tunnel helpers ────────────────────────────────────────────────────────
+
+_SSH_KEY_CANDIDATES = [
+    ".ssh/id_ed25519",
+    ".ssh/id_rsa",
+    ".ssh/id_ecdsa",
+    ".ssh/id_ecdsa_sk",
+]
+
+
+def _default_ssh_key():
+    """Return the first SSH private key found in $HOME/.ssh, or empty string."""
+    for name in _SSH_KEY_CANDIDATES:
+        p = Path.home() / name
+        if p.exists():
+            return str(p)
+    return ""
+
+
+def open_ssh_tunnel(user, host, remote_port, local_port, key_path=None):
+    """
+    Open an SSH port-forward tunnel in the background:
+      local_port  ->  host:remote_port
+
+    Uses -o ExitOnForwardFailure so the ssh process exits immediately if
+    binding fails, instead of silently hanging.
+    """
+    cmd = [
+        "ssh",
+        "-N", "-f",                          # background, no remote command
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=yes",
+        "-L", f"{local_port}:localhost:{remote_port}",
+        f"{user}@{host}",
+    ]
+    if key_path:
+        cmd += ["-i", key_path]
+
+    r = subprocess.run(cmd, check=False)
+    if r.returncode == 0:
+        ok(f"SSH tunnel open: localhost:{local_port} → {host}:{remote_port}")
+        return True
+    fail("SSH tunnel failed — check host, user, and key")
+    return False
+
+
+def prompt_ssh_credentials():
+    """
+    Interactively collect SSH connection details.
+    Returns (user, host, remote_port, key_path_or_None).
+    """
+    print()
+    remote_host = prompt("Remote host (IP address or hostname)")
+    remote_port = prompt("Remote Ollama port", default="11434")
+    ssh_user    = prompt("SSH username", default=os.environ.get("USER", "ubuntu"))
+
+    print()
+    print("  SSH authentication:")
+    print("    1)  Private key  (recommended)")
+    print("    2)  Password / SSH agent")
+    auth = prompt("Choose", choices=["1", "2"])
+
+    key_path = None
+    if auth == "1":
+        default_key = _default_ssh_key()
+        default_fallback = str(Path.home() / ".ssh" / "id_ed25519")
+        raw = prompt("Path to SSH private key", default=default_key or default_fallback)
+        key_path = str(Path(raw).expanduser().resolve())
+        if not Path(key_path).exists():
+            warn(f"Key file not found: {key_path}")
+            if not confirm("Continue anyway?", default="n"):
+                sys.exit(0)
+    else:
+        info("Using SSH agent or password — you may be prompted by ssh")
+
+    return ssh_user, remote_host, int(remote_port), key_path
+
+
 # ── .env writer (runtime only — gitignored) ───────────────────────────────────
 
-def write_env(vault, pg_password, ollama_url):
-    """Write .env in the project root at runtime. This file is gitignored."""
+def write_env(vault, pg_password, ollama_url, ssh_params=None):
+    """
+    Write .env in the project root at runtime. This file is gitignored.
+
+    ssh_params, if provided, is a dict with keys:
+      user, host, remote_port, local_port, key_path (optional)
+    These are stored as OSM_SSH_* vars so `osm tunnel` can reconnect.
+    """
     env_path = PROJECT_ROOT / ".env"
-    content = "\n".join([
+    lines = [
         f"OBSIDIAN_VAULT={vault}",
         f"POSTGRES_PASSWORD={pg_password}",
         f"OLLAMA_URL={ollama_url}",
-        "",
-    ])
-    env_path.write_text(content)
+    ]
+    if ssh_params:
+        lines += [
+            "",
+            "# SSH tunnel config — used by: scripts/osm tunnel",
+            f"OSM_SSH_USER={ssh_params['user']}",
+            f"OSM_SSH_HOST={ssh_params['host']}",
+            f"OSM_SSH_REMOTE_PORT={ssh_params['remote_port']}",
+            f"OSM_SSH_LOCAL_PORT={ssh_params['local_port']}",
+        ]
+        if ssh_params.get("key_path"):
+            lines.append(f"OSM_SSH_KEY={ssh_params['key_path']}")
+    lines.append("")
+    env_path.write_text("\n".join(lines))
     ok(f"Wrote {env_path}")
 
 
@@ -351,38 +446,139 @@ def mode_docker_host_ollama():
     _done_docker()
 
 
+def _prompt_vault_location(ssh_user, ssh_host, key_path=None):
+    """
+    Ask whether the vault lives on this machine or the remote host.
+    If remote, offer to mount it via sshfs and return the local mount point.
+    Returns the local vault path to pass to Docker.
+    """
+    print()
+    print("  Where is your Obsidian vault?\n")
+    print("    1)  On this machine  (local path)")
+    print("    2)  On the remote machine  (will mount via sshfs)")
+    loc = prompt("Choose", choices=["1", "2"])
+
+    if loc == "1":
+        return prompt_vault()
+
+    # Remote vault via sshfs
+    remote_vault = prompt("Path to vault on remote machine (absolute)")
+    default_mount = str(Path.home() / "obsidian-remote-vault")
+    mount_point   = prompt("Local mount point", default=default_mount)
+
+    mount_path = Path(mount_point).expanduser().resolve()
+    mount_path.mkdir(parents=True, exist_ok=True)
+
+    if not cmd_exists("sshfs"):
+        warn("sshfs not found — install it first:")
+        if platform.system() == "Darwin":
+            info("  brew install --cask macfuse && brew install sshfs")
+        else:
+            info("  sudo apt install sshfs  (or equivalent)")
+        if not confirm("Continue without sshfs mount?", default="n"):
+            sys.exit(0)
+        # Fall back to asking for a local path
+        return prompt_vault()
+
+    header("Mounting remote vault via sshfs")
+    sshfs_cmd = ["sshfs", f"{ssh_user}@{ssh_host}:{remote_vault}", str(mount_path)]
+    if key_path:
+        sshfs_cmd += ["-o", f"IdentityFile={key_path}"]
+    sshfs_cmd += ["-o", "StrictHostKeyChecking=accept-new", "-o", "reconnect"]
+
+    r = subprocess.run(sshfs_cmd, check=False)
+    if r.returncode == 0:
+        ok(f"Mounted {ssh_host}:{remote_vault}  →  {mount_path}")
+    else:
+        fail("sshfs mount failed — check credentials and remote path")
+        if not confirm("Continue with a local vault path instead?", default="n"):
+            sys.exit(0)
+        return prompt_vault()
+
+    return str(mount_path)
+
+
 def mode_docker_remote_ollama():
-    header("Docker + remote Ollama  (Postgres in Docker, Ollama on another host)")
+    header("Docker + remote Ollama  (Postgres in Docker, Ollama on another host via SSH)")
     hr()
 
     if not check_docker() or not check_compose():
         sys.exit(1)
 
-    print()
-    remote_host = prompt("Remote Ollama hostname or IP address")
-    remote_port = prompt("Remote Ollama port", default="11434")
+    # ── SSH credentials ───────────────────────────────────────────────────────
+    header("Remote host & SSH credentials")
+    ssh_user, remote_host, remote_port, key_path = prompt_ssh_credentials()
 
-    if not check_ollama_at(remote_host, int(remote_port)):
-        if not confirm("Ollama not reachable — continue anyway?", default="n"):
+    # ── SSH tunnel for Ollama ─────────────────────────────────────────────────
+    # Use a non-standard local port to avoid clashing with a local Ollama.
+    local_tunnel_port = 11435
+
+    header("SSH tunnel")
+    tunnel_ok = open_ssh_tunnel(ssh_user, remote_host, remote_port,
+                                local_tunnel_port, key_path)
+    if tunnel_ok:
+        time.sleep(1)
+        check_ollama_at("localhost", local_tunnel_port)
+    else:
+        if not confirm("Tunnel failed — continue anyway?", default="n"):
             sys.exit(0)
 
-    ollama_url = f"http://{remote_host}:{remote_port}"
+    # Docker containers reach the host-side tunnel via host.docker.internal
+    # (macOS/Windows Docker Desktop) or the bridge gateway (Linux).
+    system      = platform.system()
+    tunnel_host = "host.docker.internal" if system in ("Darwin", "Windows") else "172.17.0.1"
+    ollama_url  = f"http://{tunnel_host}:{local_tunnel_port}"
 
-    vault = prompt_vault()
+    # ── Vault path ────────────────────────────────────────────────────────────
+    header("Obsidian vault")
+    vault = _prompt_vault_location(ssh_user, remote_host, key_path)
+
+    # ── Write .env with SSH params for future reconnect ───────────────────────
     pg_pw = prompt_pg_password()
-    write_env(vault, pg_pw, ollama_url)
+    ssh_params = {
+        "user":        ssh_user,
+        "host":        remote_host,
+        "remote_port": remote_port,
+        "local_port":  local_tunnel_port,
+        "key_path":    key_path,
+    }
+    write_env(vault, pg_pw, ollama_url, ssh_params=ssh_params)
 
+    # ── Start Docker services ─────────────────────────────────────────────────
     header("Starting services (postgres, mcp-server, dashboard)")
-    env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw, "OLLAMA_URL": ollama_url}
+    env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw,
+           "OLLAMA_URL": ollama_url}
     compose_up(services=["postgres", "mcp-server", "dashboard"], env=env)
     wait_for_postgres()
 
     header("Claude Desktop configuration")
     update_claude_config(_docker_entry())
-    _done_docker()
+    _done_docker_remote(ssh_user, remote_host, remote_port, local_tunnel_port, key_path)
 
 
 # ── Summary printers ──────────────────────────────────────────────────────────
+
+def _done_docker_remote(ssh_user, ssh_host, remote_port, local_port, key_path):
+    key_flag = f" -i {key_path}" if key_path else ""
+    tunnel_cmd = (
+        f"ssh -N -f -o ExitOnForwardFailure=yes "
+        f"-L {local_port}:localhost:{remote_port} "
+        f"{ssh_user}@{ssh_host}{key_flag}"
+    )
+    print()
+    hr()
+    ok(_c("1", "Setup complete!"))
+    print()
+    info("Dashboard:  http://localhost:8484")
+    info("Logs:       docker compose logs -f mcp-server")
+    info("Restart Claude Desktop — server starts automatically")
+    print()
+    print(f"  {_c('93', '⚠')}  The SSH tunnel must be running for Ollama to work.")
+    print(f"     Reconnect with:")
+    print(f"\n       {_c('1', tunnel_cmd)}\n")
+    info("Or run:  scripts/osm tunnel   (reads .env automatically)")
+    hr()
+
 
 def _done_native(vault):
     print()
@@ -403,6 +599,47 @@ def _done_docker():
     info("Logs:       docker compose logs -f mcp-server")
     info("Restart Claude Desktop — server starts automatically")
     hr()
+
+
+# ── Tunnel command ────────────────────────────────────────────────────────────
+
+def _read_env():
+    """Parse .env into a dict (simple KEY=VALUE, ignores comments)."""
+    env_path = PROJECT_ROOT / ".env"
+    result = {}
+    if not env_path.exists():
+        return result
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            result[k.strip()] = v.strip()
+    return result
+
+
+def cmd_tunnel():
+    """Re-open the SSH tunnel using credentials stored in .env."""
+    header("OSM Tunnel — reconnect SSH tunnel")
+    hr()
+
+    env = _read_env()
+    user        = env.get("OSM_SSH_USER")
+    host        = env.get("OSM_SSH_HOST")
+    remote_port = env.get("OSM_SSH_REMOTE_PORT", "11434")
+    local_port  = env.get("OSM_SSH_LOCAL_PORT", "11435")
+    key_path    = env.get("OSM_SSH_KEY")
+
+    if not user or not host:
+        fail("No SSH config found in .env — run osm init first")
+        sys.exit(1)
+
+    info(f"Reconnecting: {user}@{host} (tunnel localhost:{local_port} → {host}:{remote_port})")
+    ok_flag = open_ssh_tunnel(user, host, int(remote_port), int(local_port), key_path)
+    if ok_flag:
+        time.sleep(1)
+        check_ollama_at("localhost", int(local_port))
+    else:
+        sys.exit(1)
 
 
 # ── Status command ────────────────────────────────────────────────────────────
@@ -452,7 +689,7 @@ MODES_MACOS = {
     "1": ("Native",                  "Homebrew + local Postgres + local Ollama",         mode_native_macos),
     "2": ("Docker + host Ollama",    "Postgres in Docker, Ollama already on this Mac",   mode_docker_host_ollama),
     "3": ("Full Docker",             "Everything in containers  (recommended)",           mode_full_docker),
-    "4": ("Docker + remote Ollama",  "Postgres in Docker, Ollama on another machine",    mode_docker_remote_ollama),
+    "4": ("Docker + remote Ollama",  "Postgres in Docker, Ollama on another machine via SSH", mode_docker_remote_ollama),
 }
 
 MODES_LINUX = {
@@ -507,6 +744,7 @@ def cmd_init():
 COMMANDS = {
     "init":    (cmd_init,    "Interactive setup wizard"),
     "status":  (cmd_status,  "Check service health"),
+    "tunnel":  (cmd_tunnel,  "Reconnect SSH tunnel to remote Ollama host"),
     "rebuild": (cmd_rebuild, "Rebuild Docker images and restart"),
 }
 
