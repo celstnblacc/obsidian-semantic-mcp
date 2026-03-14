@@ -8,16 +8,18 @@ Usage:
 
     Open http://localhost:8484 in your browser.
 """
+from __future__ import annotations
 
 import http.server
 import json
 import os
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
-import psycopg2
 import requests
 
 from config import build_dsn
@@ -32,8 +34,13 @@ DATABASE_URL = build_dsn()
 
 _reindex_lock = threading.Lock()
 
+# Ollama health cache: (result_dict, expiry_timestamp)
+_ollama_cache: tuple[dict, float] | None = None
+_ollama_cache_lock = threading.Lock()
+_OLLAMA_CACHE_TTL = 10.0  # seconds
 
-def search_notes(query: str, limit: int = 5) -> list[dict]:
+
+def search_notes(query: str, limit: int = 5, min_similarity: float = 0.0) -> list[dict]:
     """Embed query and return top-N results as list of {path, preview, similarity}."""
     vec_str = _vec_to_str(embed(query))
     with db_conn() as conn:
@@ -42,9 +49,10 @@ def search_notes(query: str, limit: int = 5) -> list[dict]:
                 SELECT path, content,
                        1 - (embedding <=> %s::vector) AS similarity
                 FROM notes
+                WHERE 1 - (embedding <=> %s::vector) >= %s
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            """, (vec_str, vec_str, limit))
+            """, (vec_str, vec_str, min_similarity, vec_str, limit))
             rows = cur.fetchall()
     results = []
     for path, content, sim in rows:
@@ -53,6 +61,7 @@ def search_notes(query: str, limit: int = 5) -> list[dict]:
             preview = preview.replace("\n\n\n", "\n\n")
         results.append({
             "path": str(_relative(Path(path))),
+            "content": content or "",
             "preview": preview,
             "similarity": round(float(sim), 3),
         })
@@ -60,8 +69,7 @@ def search_notes(query: str, limit: int = 5) -> list[dict]:
 
 
 def _get_db_stats(stats: dict) -> None:
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
+    with db_conn() as conn:
         with conn.cursor() as cur:
             stats["db_ok"] = True
 
@@ -99,8 +107,16 @@ def _get_db_stats(stats: dict) -> None:
                 stats["recent_notes"].append(
                     {"path": rel, "indexed_at": ts.strftime("%Y-%m-%d %H:%M")}
                 )
-    finally:
-        conn.close()
+
+            # Count orphaned embeddings (in DB but not on filesystem)
+            cur.execute("SELECT path FROM notes")
+            all_paths = [row[0] for row in cur.fetchall()]
+            vault_path = os.environ.get("OBSIDIAN_VAULT", "")
+            orphaned = sum(
+                1 for p in all_paths
+                if not os.path.exists(os.path.join(vault_path, p) if vault_path else p)
+            )
+            stats["orphaned_embeddings"] = orphaned
 
 
 def _get_vault_stats(stats: dict) -> None:
@@ -117,11 +133,34 @@ def _get_vault_stats(stats: dict) -> None:
 
 
 def _get_ollama_stats(stats: dict) -> None:
-    resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-    resp.raise_for_status()
-    models = [m["name"] for m in resp.json().get("models", [])]
-    stats["ollama_ok"] = True
-    stats["model_loaded"] = any(EMBED_MODEL in m for m in models)
+    global _ollama_cache
+    now = time.monotonic()
+
+    with _ollama_cache_lock:
+        if _ollama_cache is not None:
+            cached_result, expiry = _ollama_cache
+            if now < expiry:
+                stats.update(cached_result)
+                return
+
+    # Fetch fresh result outside the lock to avoid blocking other threads
+    result: dict = {}
+    try:
+        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        models = [m["name"] for m in data.get("models", [])]
+        result["ollama_ok"] = True
+        result["model_loaded"] = any(EMBED_MODEL in m for m in models)
+    except Exception as e:
+        result["ollama_ok"] = False
+        result["model_loaded"] = False
+        result["ollama_error"] = str(e)
+
+    with _ollama_cache_lock:
+        _ollama_cache = (result, now + _OLLAMA_CACHE_TTL)
+
+    stats.update(result)
 
 
 def gather_stats() -> dict:
@@ -135,6 +174,7 @@ def gather_stats() -> dict:
         "db_size_human": "—",
         "vault_file_count": 0,
         "unindexed_count": 0,
+        "orphaned_embeddings": 0,
         "ollama_ok": False,
         "model_loaded": False,
         "recent_notes": [],
@@ -204,7 +244,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .dot.red { background: #ef4444; box-shadow: 0 0 6px #ef444480; }
   .dot.yellow { background: #eab308; box-shadow: 0 0 6px #eab30880; }
   .recent { background: #16213e; border-radius: 12px; padding: 20px;
-    border: 1px solid #1a1a3e; }
+    border: 1px solid #1a1a3e; margin-bottom: 24px; }
   .recent h2 { font-size: 1rem; color: #a78bfa; margin-bottom: 12px; }
   .recent-item {
     display: flex; justify-content: space-between; padding: 6px 0;
@@ -242,8 +282,43 @@ HTML_PAGE = """<!DOCTYPE html>
     animation: spin 0.8s linear infinite; flex-shrink: 0;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .search-panel {
+    background: #16213e; border-radius: 12px; padding: 20px;
+    border: 1px solid #1a1a3e; margin-bottom: 24px;
+  }
+  .search-panel h2 { font-size: 1rem; color: #a78bfa; margin-bottom: 14px; }
+  .search-controls {
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+    margin-bottom: 14px;
+  }
+  .search-controls label {
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 0.75rem; color: #888; text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .search-controls input[type="text"] {
+    background: #1a1a2e; border: 1px solid #2a2a5e; border-radius: 6px;
+    color: #e0e0e0; padding: 7px 10px; font-size: 0.85rem; width: 320px;
+    outline: none;
+  }
+  .search-controls input[type="text"]:focus { border-color: #a78bfa; }
+  .search-controls input[type="number"] {
+    background: #1a1a2e; border: 1px solid #2a2a5e; border-radius: 6px;
+    color: #e0e0e0; padding: 7px 10px; font-size: 0.85rem; width: 80px;
+    outline: none;
+  }
+  .search-controls input[type="number"]:focus { border-color: #a78bfa; }
+  .search-result {
+    border: 1px solid #2a2a5e; border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 10px; background: #1a1a2e;
+  }
+  .search-result:last-child { margin-bottom: 0; }
+  .search-result p { font-size: 0.82rem; color: #aaa; margin-top: 6px;
+    line-height: 1.5; }
+  .search-result code { font-size: 0.8rem; color: #c4b5fd; }
   @media (max-width: 600px) {
     .grid { grid-template-columns: 1fr 1fr; }
+    .search-controls input[type="text"] { width: 100%; }
   }
 </style>
 </head>
@@ -285,6 +360,11 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card-detail">files not yet embedded</div>
   </div>
   <div class="card">
+    <div class="card-label">Orphaned Embeddings</div>
+    <div class="card-value" id="v-orphaned">—</div>
+    <div class="card-detail">in DB but not on disk</div>
+  </div>
+  <div class="card">
     <div class="card-label">DB Size</div>
     <div class="card-value" id="v-dbsize">—</div>
     <div class="card-detail" id="d-dbsize"></div>
@@ -304,6 +384,26 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="recent">
   <h2>Recently Indexed</h2>
   <div id="recent-list"><div class="recent-item"><span class="recent-path">Loading...</span></div></div>
+</div>
+
+<div class="search-panel">
+  <h2>Test Search</h2>
+  <div class="search-controls">
+    <label>
+      Query
+      <input type="text" id="search-query" placeholder="Enter search query..." />
+    </label>
+    <label>
+      Limit
+      <input type="number" id="search-limit" value="5" min="1" max="20" />
+    </label>
+    <label>
+      Min Similarity
+      <input type="number" id="search-min-sim" value="0.0" min="0.0" max="1.0" step="0.1" />
+    </label>
+    <button class="btn btn-standalone" onclick="testSearch()">Search</button>
+  </div>
+  <div id="search-results"></div>
 </div>
 
 <p class="footer" id="footer">Fetching...</p>
@@ -342,6 +442,8 @@ async function fetchStats() {
     document.getElementById('v-indexed').textContent = s.indexed_count;
     document.getElementById('v-vault').textContent = s.vault_file_count;
     document.getElementById('v-gap').textContent = s.unindexed_count;
+    document.getElementById('v-orphaned').textContent =
+      s.orphaned_embeddings !== undefined ? s.orphaned_embeddings : '—';
     document.getElementById('v-dbsize').textContent = s.db_size_human;
     document.getElementById('v-last').textContent = timeAgo(s.last_indexed);
     document.getElementById('d-last').textContent = s.last_indexed
@@ -404,12 +506,12 @@ async function triggerReindex(full) {
   const label = full ? 'Clear & Rebuild' : 'Re-index';
   const btn = document.getElementById(id);
   btn.disabled = true;
-  btn.textContent = 'Starting…';
+  btn.textContent = 'Starting\u2026';
   try {
     const r = await fetch(full ? '/api/reindex/full' : '/api/reindex', { method: 'POST' });
     const d = await r.json();
     if (d.ok) {
-      btn.textContent = 'Running…';
+      btn.textContent = 'Running\u2026';
       document.getElementById('indexing-banner').classList.remove('hidden');
       setTimeout(() => pollReindexDone(id, label), 3000);
     } else {
@@ -437,6 +539,26 @@ async function startOllama() {
   setTimeout(() => { btn.disabled = false; btn.textContent = 'Start'; }, 5000);
 }
 
+async function testSearch() {
+  const q = document.getElementById('search-query').value.trim();
+  if (!q) return;
+  const limit = document.getElementById('search-limit').value;
+  const minSim = document.getElementById('search-min-sim').value;
+  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}&min_similarity=${minSim}`);
+  const data = await res.json();
+  const div = document.getElementById('search-results');
+  if (!data.results || data.results.length === 0) {
+    div.innerHTML = '<p>No results.</p>';
+    return;
+  }
+  div.innerHTML = data.results.map(r => `
+    <div class="search-result">
+      <strong>${(r.similarity * 100).toFixed(1)}%</strong> \u2014 <code>${r.path}</code>
+      <p>${r.content.substring(0, 200)}...</p>
+    </div>
+  `).join('');
+}
+
 fetchStats();
 setInterval(fetchStats, 30000);
 </script>
@@ -446,7 +568,7 @@ setInterval(fetchStats, 30000);
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
-    def _json_response(self, code, data):
+    def _json_response(self, code: int, data: dict) -> None:
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -454,17 +576,17 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path.startswith("/api/search"):
-            from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
             query = qs.get("q", [""])[0].strip()
             limit = min(int(qs.get("limit", ["5"])[0]), 20)
+            min_similarity = float(qs.get("min_similarity", ["0.0"])[0])
             if not query:
                 self._json_response(400, {"error": "missing ?q="})
                 return
             try:
-                results = search_notes(query, limit)
+                results = search_notes(query, limit, min_similarity)
                 self._json_response(200, {"query": query, "results": results})
             except Exception as e:
                 self._json_response(500, {"error": str(e)})
@@ -483,7 +605,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         if self.path == "/api/ollama/start":
             try:
                 subprocess.Popen(
