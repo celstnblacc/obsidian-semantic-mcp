@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Secrets / certificates
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+
+# Test cache
+.pytest_cache/
+shipguard.txt

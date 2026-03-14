@@ -1,0 +1,20 @@
+[project]
+name = "obsidian-semantic-mcp"
+version = "0.1.0"
+description = "Semantic search MCP server for Obsidian vaults"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "mcp",
+    "psycopg2-binary",
+    "watchdog",
+    "requests",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/test_unit.py"]

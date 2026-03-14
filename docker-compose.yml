@@ -1,0 +1,92 @@
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: obsidian_brain
+      POSTGRES_USER: obsidian
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"   # 5433 to avoid conflict with host postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obsidian -d obsidian_brain"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11435:11434"  # 11435 to avoid conflict with host ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot container to pull the embedding model if missing
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+
+  mcp-server:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      OBSIDIAN_VAULT: /vault
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: obsidian_brain
+      POSTGRES_USER: obsidian
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      OLLAMA_URL: http://ollama:11434
+      EMBEDDING_MODEL: nomic-embed-text
+    volumes:
+      - ${OBSIDIAN_VAULT:-.}:/vault:ro
+    # stdio transport — Claude Desktop connects via `docker exec`
+    stdin_open: true
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    command: ["python3", "src/dashboard.py"]
+    environment:
+      OBSIDIAN_VAULT: /vault
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: obsidian_brain
+      POSTGRES_USER: obsidian
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      OLLAMA_URL: http://ollama:11434
+      EMBEDDING_MODEL: nomic-embed-text
+      DASHBOARD_PORT: "8484"
+    volumes:
+      - ${OBSIDIAN_VAULT:-.}:/vault:ro
+    ports:
+      - "8484:8484"
+
+volumes:
+  pgdata:
+  ollama_data:
