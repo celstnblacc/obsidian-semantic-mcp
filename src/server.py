@@ -22,7 +22,9 @@ Environment variables:
   POSTGRES_PASSWORD postgres password           (default: empty)
   OLLAMA_URL        ollama API endpoint         (default: http://localhost:11434)
   EMBEDDING_MODEL   ollama model name           (default: nomic-embed-text)
+  EMBED_TIMEOUT     seconds before embed request times out (default: 15)
 """
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -34,8 +36,10 @@ import signal
 import sys
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import psycopg2
 import psycopg2.pool
@@ -51,9 +55,10 @@ from config import build_dsn
 
 # ─────────────────────────────────── Config ─────────────────────────────────
 
-VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
-OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-EMBED_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
+VAULT_PATH   = os.environ.get("OBSIDIAN_VAULT", "")
+OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+EMBED_MODEL  = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
+EMBED_TIMEOUT = int(os.environ.get("EMBED_TIMEOUT", "15"))
 
 DATABASE_URL = build_dsn()
 
@@ -73,6 +78,40 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+# ───────────────────────────────── LRU Cache ─────────────────────────────────
+
+class _TTLCache:
+    """Simple LRU cache with TTL expiry for search results."""
+
+    def __init__(self, maxsize: int = 256, ttl: int = 600):
+        self._cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+
+    def get(self, key: str) -> Any | None:
+        if key not in self._cache:
+            return None
+        ts, value = self._cache[key]
+        if time.monotonic() - ts > self._ttl:
+            del self._cache[key]
+            return None
+        self._cache.move_to_end(key)
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = (time.monotonic(), value)
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+    def invalidate(self) -> None:
+        self._cache.clear()
+
+
+_search_cache = _TTLCache(maxsize=256, ttl=600)
 
 
 # ──────────────────────────────── Database ───────────────────────────────────
@@ -114,7 +153,7 @@ def db_conn():
         pool.putconn(conn)
 
 
-def init_db():
+def init_db() -> None:
     with db_conn() as conn:
         with conn:
             with conn.cursor() as cur:
@@ -129,13 +168,18 @@ def init_db():
                         indexed_at TIMESTAMP DEFAULT NOW()
                     );
                 """)
+                # Auto-tune IVFFlat lists based on vault size
+                cur.execute("SELECT COUNT(*) FROM notes")
+                note_count = cur.fetchone()[0]
+                lists = max(10, min(note_count // 50, 500)) if note_count > 0 else 100
+                lists = int(lists)  # ensure integer before string formatting
                 # IVFFlat index for fast approximate nearest-neighbour search
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS notes_embedding_idx
                     ON notes USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = 100);
-                """)
-    log.info("Database initialised")
+                    WITH (lists = %s);
+                """ % lists)
+    log.info("Database initialised (IVFFlat lists=%d)", lists)
 
 
 # ──────────────────────────────── Embeddings ─────────────────────────────────
@@ -148,18 +192,29 @@ def _vec_to_str(vec: list[float]) -> str:
 
 
 def embed(text: str) -> list[float]:
-    """Embed text with Ollama. Truncates to MAX_EMBED_CHARS to stay within model limits."""
+    """Embed text with Ollama. Truncates to MAX_EMBED_CHARS to stay within model limits.
+
+    Retries up to 3 times with exponential backoff (1s → 2s → 4s) on transient errors.
+    """
     text = text[:MAX_EMBED_CHARS]
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/embeddings",
-        json={"model": EMBED_MODEL, "prompt": text},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    vec = resp.json().get("embedding", [])
-    if not vec:
-        raise ValueError(f"Empty embedding returned by Ollama for text: {text[:50]!r}")
-    return vec
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"{OLLAMA_URL}/api/embeddings",
+                json={"model": EMBED_MODEL, "prompt": text},
+                timeout=EMBED_TIMEOUT,
+            )
+            resp.raise_for_status()
+            vec = resp.json().get("embedding", [])
+            if not vec:
+                raise ValueError(f"Empty embedding returned by Ollama for text: {text[:50]!r}")
+            return vec
+        except (requests.RequestException, ValueError) as e:
+            if attempt == 2:
+                raise
+            wait = 2 ** attempt
+            log.warning("embed attempt %d failed: %s — retrying in %ds", attempt + 1, e, wait)
+            time.sleep(wait)
 
 
 # ───────────────────────────────── Indexing ──────────────────────────────────
@@ -168,7 +223,7 @@ def file_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _is_system_path(path: Path) -> bool:
+def _should_skip_path(path: Path) -> bool:
     """Skip hidden/system directories (.obsidian, .trash, .git) relative to vault root."""
     vault = _vault_root()
     try:
@@ -178,7 +233,11 @@ def _is_system_path(path: Path) -> bool:
     return any(part.startswith(".") for part in rel.parts)
 
 
-def index_note(path: str, content: str):
+# Backward-compatible alias used by existing tests
+_is_system_path = _should_skip_path
+
+
+def index_note(path: str, content: str) -> None:
     """Embed a single note and upsert into the database. Skips unchanged files."""
     h = file_hash(content)
     for attempt in range(3):
@@ -210,7 +269,7 @@ def index_note(path: str, content: str):
             raise
 
 
-def delete_note(path: str):
+def delete_note(path: str) -> None:
     with db_conn() as conn:
         with conn:
             with conn.cursor() as cur:
@@ -218,10 +277,10 @@ def delete_note(path: str):
     log.info("Removed: %s", path)
 
 
-def index_vault(vault: str):
+def index_vault(vault: str) -> None:
     """Walk the vault and index every markdown file."""
     root = Path(vault)
-    md_files = [f for f in root.rglob("*.md") if not _is_system_path(f)]
+    md_files = [f for f in root.rglob("*.md") if not _should_skip_path(f)]
     log.info("Indexing %d notes in %s…", len(md_files), vault)
     for f in md_files:
         try:
@@ -266,7 +325,7 @@ class VaultEventHandler(FileSystemEventHandler):
     def _handle_upsert(self, path: str):
         with self._lock:
             self._timers.pop(path, None)
-        if not path.endswith(".md") or _is_system_path(Path(path)):
+        if not path.endswith(".md") or _should_skip_path(Path(path)):
             return
         try:
             content = Path(path).read_text(encoding="utf-8", errors="ignore")
@@ -387,6 +446,11 @@ async def list_tools():
                         "type": "integer",
                         "description": "Number of results to return (default: 5, max: 20)",
                         "default": 5,
+                    },
+                    "min_similarity": {
+                        "type": "number",
+                        "description": "Minimum similarity score (0.0–1.0). Results below this threshold are excluded. Default: 0.0",
+                        "default": 0.0,
                     },
                 },
                 "required": ["query"],
@@ -546,11 +610,19 @@ async def call_tool(name: str, arguments: dict):
     if name == "search_vault":
         query = arguments.get("query", "").strip()
         limit = max(1, min(int(arguments.get("limit", 5)), 20))
+        min_similarity = float(arguments.get("min_similarity", 0.0))
 
         if not query:
             return [TextContent(type="text", text="Please provide a search query.")]
 
+        # Check LRU cache before hitting Ollama + DB
+        cache_key = hashlib.sha256(f"{query}:{limit}:{min_similarity}".encode()).hexdigest()
+        cached = _search_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
+            _t0 = time.monotonic()
             loop = asyncio.get_running_loop()
             vec = await loop.run_in_executor(None, embed, query)
             vec_str = _vec_to_str(vec)
@@ -567,7 +639,10 @@ async def call_tool(name: str, arguments: dict):
                         """, (vec_str, vec_str, limit))
                         rows = cur.fetchall()
 
-            if not rows:
+            # Apply similarity threshold filter
+            results = [r for r in rows if r[2] >= min_similarity]
+
+            if not results:
                 if _INDEXING_IN_PROGRESS.is_set():
                     return [TextContent(
                         type="text",
@@ -579,7 +654,7 @@ async def call_tool(name: str, arguments: dict):
                 )]
 
             parts = []
-            for path, content, sim in rows:
+            for path, content, sim in results:
                 rel = _relative(Path(path))
                 preview = content[:600].strip()
                 # collapse excess blank lines
@@ -587,7 +662,17 @@ async def call_tool(name: str, arguments: dict):
                     preview = preview.replace("\n\n\n", "\n\n")
                 parts.append(f"**{rel}** _(similarity: {sim:.2f})_\n\n{preview}\n")
 
-            return [TextContent(type="text", text="\n---\n".join(parts))]
+            result = [TextContent(type="text", text="\n---\n".join(parts))]
+
+            _duration_ms = int((time.monotonic() - _t0) * 1000)
+            _query_hash = hashlib.sha256(query.encode()).hexdigest()[:8]
+            log.info(
+                "search query_hash=%s limit=%d found=%d duration_ms=%d",
+                _query_hash, limit, len(results), _duration_ms,
+            )
+
+            _search_cache.set(cache_key, result)
+            return result
 
         except Exception as e:
             log.error("search_vault error: %s", e)
@@ -631,6 +716,7 @@ async def call_tool(name: str, arguments: dict):
                 text="OBSIDIAN_VAULT environment variable is not set.",
             )]
 
+        _search_cache.invalidate()
         threading.Thread(
             target=index_vault,
             args=(VAULT_PATH,),
@@ -734,7 +820,7 @@ async def call_tool(name: str, arguments: dict):
             results = []
             root = _vault_root()
             for f in root.rglob("*.md"):
-                if _is_system_path(f):
+                if _should_skip_path(f):
                     continue
                 try:
                     text = f.read_text(encoding="utf-8", errors="ignore")
@@ -781,7 +867,7 @@ async def call_tool(name: str, arguments: dict):
 
             files = []
             for f in root.rglob("*.md"):
-                if _is_system_path(f):
+                if _should_skip_path(f):
                     continue
                 try:
                     mtime = f.stat().st_mtime
