@@ -1,0 +1,32 @@
+# ShipGuard configuration
+# See: https://github.com/DevOpsCelstn/shipguard
+
+# Minimum severity to report: critical, high, medium, low
+severity_threshold: medium
+
+# Glob patterns for paths to exclude from scanning
+exclude_paths:
+  - "vendor/**"
+  - "node_modules/**"
+  - "**/fixtures/**"
+  - "**/__snapshots__/**"
+  - "osm_init.py"  # setup wizard — no SQL; PY-007 false-positives on bash-launcher f-strings
+
+# Rule IDs to disable
+disable_rules: []
+  # - SHELL-008
+  # - JS-007
+
+# Additional directories containing custom rule modules
+custom_rules_dirs: []
+
+# Optional: use Rust-accelerated secrets scanning (SEC-001/002/003)
+# Requires a built `shipguard-secrets` binary in PATH or SHIPGUARD_RUST_SECRETS_BIN.
+use_rust_secrets: false
+
+# Per-rule configuration overrides
+rule_config:
+  PY-007:
+    # osm_init.py builds a bash launcher script using f-strings — not SQL queries.
+    # PY-007 (SQL injection) fires as a false positive on the launcher path variable.
+    skip_paths: ["osm_init.py"]

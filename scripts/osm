@@ -2,9 +2,9 @@
 # osm — Obsidian Semantic MCP CLI wrapper
 #
 # Usage:
-#   scripts/osm init       Interactive setup wizard
-#   scripts/osm status     Check service health
-#   scripts/osm rebuild    Rebuild Docker images
+#   osm init       Interactive setup wizard
+#   osm status     Check service health
+#   osm rebuild    Rebuild Docker images
 #
 # If uv is available, uses the project venv automatically.
 # Otherwise falls back to system python3.

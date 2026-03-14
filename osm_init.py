@@ -817,6 +817,7 @@ def _link_osm_to_path():
 
     bin_dir.mkdir(parents=True, exist_ok=True)
     try:
+        launcher.unlink(missing_ok=True)  # remove symlink before writing — write_text follows symlinks
         launcher.write_text(script)
         launcher.chmod(0o755)
         primary.chmod(0o755)

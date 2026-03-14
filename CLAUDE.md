@@ -37,17 +37,19 @@ OBSIDIAN_VAULT="/path/to/vault" uv run python3 src/dashboard.py
 ## osm CLI
 
 ```bash
-scripts/osm init                                         # Interactive setup wizard
-scripts/osm init --mode 3 --vault /path --persistent     # Non-interactive (agent/script friendly)
-scripts/osm init --dry-run                               # Preview all actions without making changes
-scripts/osm status                                       # Check service health
-scripts/osm tunnel                                       # Reconnect SSH tunnel (remote Ollama)
-scripts/osm rebuild                                      # Rebuild Docker images
-scripts/osm remove                                       # Stop services, wipe volumes and config
-scripts/osm help                                         # Full flag reference
+osm init                                              # Interactive setup wizard
+osm init --mode 3 --vault /path --persistent          # Non-interactive (agent/script friendly)
+osm init --dry-run                                    # Preview all actions without making changes
+osm status                                            # Check service health
+osm tunnel                                            # Reconnect SSH tunnel (remote Ollama)
+osm rebuild                                           # Rebuild Docker images
+osm remove                                            # Stop services, wipe volumes and config
+osm remove --yes                                      # Non-interactive teardown (agent/script friendly)
+osm help                                              # Full flag reference
 ```
 
 **init flags:** `--mode`, `--vault`, `--pg-password`, `--persistent` / `--no-persistent`, `--data-dir`, `--ssh-host`, `--ssh-user`, `--ssh-port`, `--ssh-key`, `--vault-remote`
+**remove flags:** `--yes` (skip confirmation)
 
 ## Project Conventions
 
