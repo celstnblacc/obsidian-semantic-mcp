@@ -944,9 +944,12 @@ def cmd_remove():
     print("    • Stop and remove all Docker containers and volumes  (all indexed embeddings lost)")
     print("    • Delete .env from this project")
     print("    • Remove obsidian-semantic from claude_desktop_config.json")
+    print("    • Remove obsidian-semantic from Claude Code CLI  ($HOME/.claude.json)")
+    print("    • Delete the osm launcher from $HOME/.local/bin/osm")
     print()
 
-    if not DRY_RUN and not confirm("Continue?", default="n"):
+    force = _PARAMS.get("yes") == "y"
+    if not DRY_RUN and not force and not confirm("Continue?", default="n"):
         info("Aborted — nothing changed")
         return
 
@@ -997,6 +1000,32 @@ def cmd_remove():
             warn(f"Could not parse {cfg_path} — remove entry manually")
     else:
         info("Claude Desktop config not found — skipping")
+
+    # ── Claude Code CLI ───────────────────────────────────────────────────────
+    header("Updating Claude Code CLI config")
+    if cmd_exists("claude"):
+        if DRY_RUN:
+            _dry("claude mcp remove obsidian-semantic")
+        else:
+            r = run(["claude", "mcp", "remove", "--scope", "user", "obsidian-semantic"],
+                    check=False)
+            if r.returncode == 0:
+                ok("Removed obsidian-semantic from Claude Code CLI")
+            else:
+                info("obsidian-semantic not found in Claude Code CLI — skipping")
+    else:
+        info("claude CLI not found — skipping")
+
+    # ── osm launcher ──────────────────────────────────────────────────────────
+    header("Removing osm launcher")
+    launcher = Path.home() / ".local" / "bin" / "osm"
+    if DRY_RUN:
+        _dry(f"remove {launcher}")
+    elif launcher.exists():
+        launcher.unlink()
+        ok(f"Deleted {launcher}")
+    else:
+        info("osm launcher not found — skipping")
 
     if not DRY_RUN:
         print()
@@ -1078,6 +1107,7 @@ def cmd_help():
     print()
     print(f"  {_c('1', 'Flags:')}\n")
     print(f"    {_c('1', '--dry-run')}              Print every action that would run — make no changes")
+    print(f"    {_c('1', '--yes')}                 Skip confirmation prompts  (use with: osm remove)")
     print()
     print(f"  {_c('1', 'init flags')}  (skip interactive prompts — usable from scripts or AI agents)\n")
     print(f"    {_c('1', '--mode <1-4>')}          Installation mode (macOS: 1=native 2=docker+host-ollama 3=full-docker 4=remote-ollama)")
@@ -1132,6 +1162,7 @@ _FLAG_MAP = {
     "ssh-port":     "ssh_port",
     "ssh-key":      "ssh_key",
     "vault-remote": "vault_remote",
+    "yes":          "yes",          # boolean — skip all confirms in remove
 }
 
 
@@ -1156,6 +1187,10 @@ def _parse_flags(args):
             continue
         if a == "--no-persistent":
             params["persistent"] = "n"
+            i += 1
+            continue
+        if a == "--yes":
+            params["yes"] = "y"
             i += 1
             continue
         if a.startswith("--"):
