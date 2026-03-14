@@ -160,6 +160,9 @@ def prompt_persistent_storage(include_ollama=False):
         return None, None
 
     default_dir = str(Path.home() / ".local" / "share" / "obsidian-semantic-mcp")
+    # When --persistent is set without --data-dir, use the default silently
+    if "persistent" in _PARAMS and "data_dir" not in _PARAMS:
+        _PARAMS["data_dir"] = default_dir
     raw = prompt("Local data directory", default=default_dir, param_key="data_dir")
     data_dir = Path(raw).expanduser().resolve()
 
