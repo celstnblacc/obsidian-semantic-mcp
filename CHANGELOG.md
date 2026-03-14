@@ -9,6 +9,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.3.0] — 2026-03-15
+
+### Added
+- LRU search cache (256-entry, 10-min TTL) — repeated queries skip Ollama entirely
+- `min_similarity` parameter on `search_vault` — filter low-relevance results
+- Embedding retry with exponential backoff (3 attempts, 1s → 2s)
+- Configurable `EMBED_TIMEOUT` env var (default 15s)
+- Structured search logging: query hash, result count, duration_ms
+- IVFFlat `lists` auto-tuned from vault size (10–500 range)
+- Search testing UI panel in dashboard — test queries without leaving the browser
+- `/api/search` endpoint with `min_similarity` support
+- Orphaned embeddings count in dashboard stats
+- Ollama health check: 5s timeout, 10s result cache
+- SSH tunnel connectivity test before launching tunnel (mode 4/3)
+- Vault health check during `osm init` — warns if path has no `.md` files
+- Ollama model verification after pull
+- Docker pull progress streamed in real-time during setup
+- `CONTRIBUTING.md` — dev setup, code style, commit conventions, PR checklist
+- `ARCHITECTURE.md` — component map, design decisions, DB schema, data flows
+- GitHub issue templates (bug report, feature request)
+- CI workflow: run unit tests on push/PR (`.github/workflows/tests.yml`)
+- CI workflow: publish Docker images on version tags (`.github/workflows/docker-hub.yml`)
+
+### Changed
+- Ollama and PostgreSQL ports restricted to `127.0.0.1` (localhost only)
+- Resource limits added to all containers (postgres: 1GB, ollama: 4GB, server: 512MB, dashboard: 256MB)
+- Log rotation enabled: 100MB max, 3 files per service
+- Dashboard port configurable via `DASHBOARD_PORT` env var
+- Internal bridge network (`obsidian-internal`) isolates container traffic
+- All dependencies pinned to exact versions
+- Python minimum bumped to 3.11
+- `_get_db_stats` uses `db_conn()` pool (was calling `psycopg2.connect()` directly)
+- Type hints added throughout `server.py` and `dashboard.py`
+
+### Fixed
+- Vault validation warns without blocking in `--vault`, `$OBSIDIAN_VAULT`, and interactive paths
+
+---
+
 ## [0.2.0] — 2026-03-14
 
 ### Added
