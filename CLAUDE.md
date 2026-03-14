@@ -34,9 +34,24 @@ OBSIDIAN_VAULT="/path/to/vault" DATABASE_URL="postgresql://localhost/obsidian_br
 OBSIDIAN_VAULT="/path/to/vault" uv run python3 src/dashboard.py
 ```
 
+## osm CLI
+
+```bash
+scripts/osm init                                         # Interactive setup wizard
+scripts/osm init --mode 3 --vault /path --persistent     # Non-interactive (agent/script friendly)
+scripts/osm init --dry-run                               # Preview all actions without making changes
+scripts/osm status                                       # Check service health
+scripts/osm tunnel                                       # Reconnect SSH tunnel (remote Ollama)
+scripts/osm rebuild                                      # Rebuild Docker images
+scripts/osm remove                                       # Stop services, wipe volumes and config
+scripts/osm help                                         # Full flag reference
+```
+
+**init flags:** `--mode`, `--vault`, `--pg-password`, `--persistent` / `--no-persistent`, `--data-dir`, `--ssh-host`, `--ssh-user`, `--ssh-port`, `--ssh-key`, `--vault-remote`
+
 ## Project Conventions
 
-- All database connections closed via `try/finally conn.close()` — no context manager shortcut
+- DB access via `db_conn()` context manager — uses `ThreadedConnectionPool(1,5)`, never call `psycopg2.connect()` directly
 - `_handle_upsert` must catch all exceptions — watchdog thread must never die
 - Empty Ollama embeddings (`[]`) raise `ValueError` — never insert invalid vectors
 - `_resolve_vault_path()` enforces vault root — no path traversal
