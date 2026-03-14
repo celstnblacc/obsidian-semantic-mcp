@@ -181,25 +181,33 @@ def _is_system_path(path: Path) -> bool:
 def index_note(path: str, content: str):
     """Embed a single note and upsert into the database. Skips unchanged files."""
     h = file_hash(content)
-    with db_conn() as conn:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT hash FROM notes WHERE path = %s", (path,))
-                row = cur.fetchone()
-                if row and row[0] == h:
-                    return  # unchanged — skip embedding call
+    for attempt in range(3):
+        try:
+            with db_conn() as conn:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT hash FROM notes WHERE path = %s", (path,))
+                        row = cur.fetchone()
+                        if row and row[0] == h:
+                            return  # unchanged — skip embedding call
 
-                vec = embed(content)
-                cur.execute("""
-                    INSERT INTO notes (path, content, hash, embedding, indexed_at)
-                    VALUES (%s, %s, %s, %s::vector, NOW())
-                    ON CONFLICT (path) DO UPDATE
-                        SET content    = EXCLUDED.content,
-                            hash       = EXCLUDED.hash,
-                            embedding  = EXCLUDED.embedding,
-                            indexed_at = NOW()
-                """, (path, content, h, _vec_to_str(vec)))
-    log.info("Indexed: %s", path)
+                        vec = embed(content)
+                        cur.execute("""
+                            INSERT INTO notes (path, content, hash, embedding, indexed_at)
+                            VALUES (%s, %s, %s, %s::vector, NOW())
+                            ON CONFLICT (path) DO UPDATE
+                                SET content    = EXCLUDED.content,
+                                    hash       = EXCLUDED.hash,
+                                    embedding  = EXCLUDED.embedding,
+                                    indexed_at = NOW()
+                        """, (path, content, h, _vec_to_str(vec)))
+            log.info("Indexed: %s", path)
+            return
+        except psycopg2.Error as e:
+            if e.pgcode == "40P01" and attempt < 2:  # deadlock — retry
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
 
 
 def delete_note(path: str):
