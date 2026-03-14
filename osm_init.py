@@ -39,9 +39,26 @@ def header(msg): print(f"\n{_c('1', msg)}")
 def hr():        print("─" * 60)
 
 
+# ── Dry-run state ─────────────────────────────────────────────────────────────
+
+DRY_RUN     = False
+_DRY_ACTIONS: list[str] = []   # collects every skipped action for the summary
+
+
+def _dry(label, detail=""):
+    """Print a dry-run notice and record it for the end-of-run summary."""
+    line = f"{label}{('  # ' + detail) if detail else ''}"
+    print(f"  {_c('90', '[dry-run]')}  {line}")
+    _DRY_ACTIONS.append(line)
+
+
 # ── Subprocess helpers ────────────────────────────────────────────────────────
 
 def run(cmd, check=True, capture=False, env=None):
+    if DRY_RUN:
+        cmd_str = cmd if isinstance(cmd, str) else " ".join(str(a) for a in cmd)
+        _dry(cmd_str)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     kwargs = {"shell": isinstance(cmd, str), "check": check}
     if env:
         kwargs["env"] = env
@@ -174,6 +191,9 @@ def open_ssh_tunnel(user, host, remote_port, local_port, key_path=None):
     if key_path:
         cmd += ["-i", key_path]
 
+    if DRY_RUN:
+        _dry(" ".join(cmd), f"tunnel localhost:{local_port} → {host}:{remote_port}")
+        return True
     r = subprocess.run(cmd, check=False)
     if r.returncode == 0:
         ok(f"SSH tunnel open: localhost:{local_port} → {host}:{remote_port}")
@@ -242,6 +262,13 @@ def write_env(vault, pg_password, ollama_url, ssh_params=None):
         if ssh_params.get("key_path"):
             lines.append(f"OSM_SSH_KEY={ssh_params['key_path']}")
     lines.append("")
+    if DRY_RUN:
+        _dry(f"write {env_path}", "contents shown below")
+        print()
+        for l in lines:
+            print(f"    {_c('90', l)}")
+        print()
+        return
     env_path.write_text("\n".join(lines))
     ok(f"Wrote {env_path}")
 
@@ -270,6 +297,14 @@ def update_claude_config(entry):
         except json.JSONDecodeError:
             warn(f"Could not parse {path} — mcpServers section will be reset")
     cfg.setdefault("mcpServers", {})["obsidian-semantic"] = entry
+    pretty = json.dumps({"mcpServers": {"obsidian-semantic": entry}}, indent=2)
+    if DRY_RUN:
+        _dry(f"write {path}", "contents shown below")
+        print()
+        for l in pretty.splitlines():
+            print(f"    {_c('90', l)}")
+        print()
+        return
     path.write_text(json.dumps(cfg, indent=2) + "\n")
     ok(f"Updated {path}")
     info("Restart Claude Desktop to pick up the new server")
@@ -367,12 +402,15 @@ def mode_native_macos():
 
     if not check_ollama_at("localhost"):
         info("Starting ollama serve in background…")
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        time.sleep(2)
+        if DRY_RUN:
+            _dry("ollama serve  (background)")
+        else:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(2)
 
     info("Pulling nomic-embed-text (first run may take a few minutes)…")
     run("ollama pull nomic-embed-text")
@@ -467,7 +505,8 @@ def _prompt_vault_location(ssh_user, ssh_host, key_path=None):
     mount_point   = prompt("Local mount point", default=default_mount)
 
     mount_path = Path(mount_point).expanduser().resolve()
-    mount_path.mkdir(parents=True, exist_ok=True)
+    if not DRY_RUN:
+        mount_path.mkdir(parents=True, exist_ok=True)
 
     if not cmd_exists("sshfs"):
         warn("sshfs not found — install it first:")
@@ -577,6 +616,22 @@ def _done_docker_remote(ssh_user, ssh_host, remote_port, local_port, key_path):
     print(f"     Reconnect with:")
     print(f"\n       {_c('1', tunnel_cmd)}\n")
     info("Or run:  scripts/osm tunnel   (reads .env automatically)")
+    hr()
+
+
+def _done_dry_run():
+    print()
+    hr()
+    print(f"  {_c('93', '⚠')}  {_c('1', 'DRY RUN — no changes were made')}")
+    print()
+    if _DRY_ACTIONS:
+        print(f"  {_c('1', 'Actions that would have run:')}\n")
+        for i, action in enumerate(_DRY_ACTIONS, 1):
+            print(f"  {_c('90', str(i) + '.')}  {action}")
+    else:
+        print("  (no actions would have run)")
+    print()
+    info("Re-run without --dry-run to apply")
     hr()
 
 
@@ -739,6 +794,27 @@ def cmd_init():
     handler()
 
 
+# ── Help command ──────────────────────────────────────────────────────────────
+
+def cmd_help():
+    print(f"\n  {_c('1', 'osm')} — Obsidian Semantic MCP CLI\n")
+    print(f"  {_c('1', 'Usage:')}  scripts/osm <command> [--dry-run]\n")
+    print(f"  {_c('1', 'Commands:')}\n")
+    for name, (_, desc) in COMMANDS.items():
+        print(f"    {_c('1', f'osm {name:<10}')}  {desc}")
+    print()
+    print(f"  {_c('1', 'Flags:')}\n")
+    print(f"    {_c('1', '--dry-run')}   Print every action that would run — make no changes")
+    print()
+    print(f"  {_c('1', 'Examples:')}\n")
+    print(f"    scripts/osm init              # Interactive setup")
+    print(f"    scripts/osm init --dry-run    # Preview setup steps without changes")
+    print(f"    scripts/osm status            # Check service health")
+    print(f"    scripts/osm tunnel            # Reconnect SSH tunnel (remote Ollama)")
+    print(f"    scripts/osm rebuild           # Rebuild Docker images")
+    print()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 COMMANDS = {
@@ -746,18 +822,39 @@ COMMANDS = {
     "status":  (cmd_status,  "Check service health"),
     "tunnel":  (cmd_tunnel,  "Reconnect SSH tunnel to remote Ollama host"),
     "rebuild": (cmd_rebuild, "Rebuild Docker images and restart"),
+    "help":    (cmd_help,    "Show this help message"),
 }
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print(f"\n  {_c('1', 'osm')} — Obsidian Semantic MCP CLI\n")
-        for name, (_, desc) in COMMANDS.items():
-            print(f"    osm {name:<10}  {desc}")
-        print()
-        sys.exit(0 if len(sys.argv) == 1 else 1)
+    global DRY_RUN
 
-    COMMANDS[sys.argv[1]][0]()
+    args = sys.argv[1:]
+
+    # Strip --dry-run from args and activate dry-run mode
+    if "--dry-run" in args:
+        DRY_RUN = True
+        args = [a for a in args if a != "--dry-run"]
+        info("Dry-run mode — no changes will be made")
+        print()
+
+    # No command or explicit help request
+    if not args or args[0] in ("--help", "-h"):
+        cmd_help()
+        sys.exit(0)
+
+    cmd = args[0]
+
+    if cmd not in COMMANDS:
+        fail(f"Unknown command: {cmd!r}")
+        print()
+        cmd_help()
+        sys.exit(1)
+
+    COMMANDS[cmd][0]()
+
+    if DRY_RUN:
+        _done_dry_run()
 
 
 if __name__ == "__main__":
