@@ -12,12 +12,24 @@ services:
       # leave unset to use the named Docker volume (wiped by `down -v`).
       - ${PGDATA_PATH:-pgdata}:/var/lib/postgresql/data
     ports:
-      - "5433:5432"   # 5433 to avoid conflict with host postgres
+      - "127.0.0.1:5433:5432"   # 5433 to avoid conflict with host postgres
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U obsidian -d obsidian_brain"]
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+        reservations:
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks: [obsidian-internal]
 
   ollama:
     image: ollama/ollama:latest
@@ -28,12 +40,24 @@ services:
       # leave unset to use the named Docker volume (wiped by `down -v`).
       - ${OLLAMA_DATA_PATH:-ollama_data}:/root/.ollama
     ports:
-      - "11435:11434"  # 11435 to avoid conflict with host ollama
+      - "127.0.0.1:11435:11434"  # 11435 to avoid conflict with host ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks: [obsidian-internal]
 
   # One-shot container to pull the embedding model if missing
   ollama-pull:
@@ -46,6 +70,7 @@ services:
     entrypoint: ["ollama", "pull", "nomic-embed-text"]
     environment:
       OLLAMA_HOST: http://ollama:11434
+    networks: [obsidian-internal]
 
   mcp-server:
     build: .
@@ -66,6 +91,24 @@ services:
       - ${OBSIDIAN_VAULT:-.}:/vault:ro
     # stdio transport — Claude Desktop connects via `docker exec`
     stdin_open: true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+        reservations:
+          memory: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks: [obsidian-internal]
 
   dashboard:
     build: .
@@ -83,12 +126,28 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       EMBEDDING_MODEL: nomic-embed-text
-      DASHBOARD_PORT: "8484"
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8484}
     volumes:
       - ${OBSIDIAN_VAULT:-.}:/vault:ro
     ports:
-      - "8484:8484"
+      - "${DASHBOARD_PORT:-8484}:8484"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+        reservations:
+          memory: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks: [obsidian-internal]
 
 volumes:
   pgdata:
   ollama_data:
+
+networks:
+  obsidian-internal:
+    driver: bridge
