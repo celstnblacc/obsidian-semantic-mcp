@@ -21,7 +21,7 @@ import psycopg2
 import requests
 
 from config import build_dsn
-from server import db_conn, index_vault
+from server import db_conn, embed, index_vault, _vec_to_str, _relative
 
 VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -31,6 +31,32 @@ DASH_PORT   = int(os.environ.get("DASHBOARD_PORT", "8484"))
 DATABASE_URL = build_dsn()
 
 _reindex_lock = threading.Lock()
+
+
+def search_notes(query: str, limit: int = 5) -> list[dict]:
+    """Embed query and return top-N results as list of {path, preview, similarity}."""
+    vec_str = _vec_to_str(embed(query))
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT path, content,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM notes
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (vec_str, vec_str, limit))
+            rows = cur.fetchall()
+    results = []
+    for path, content, sim in rows:
+        preview = content[:400].strip()
+        while "\n\n\n" in preview:
+            preview = preview.replace("\n\n\n", "\n\n")
+        results.append({
+            "path": str(_relative(Path(path))),
+            "preview": preview,
+            "similarity": round(float(sim), 3),
+        })
+    return results
 
 
 def _get_db_stats(stats: dict) -> None:
@@ -429,7 +455,20 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/api/reindex/status":
+        if self.path.startswith("/api/search"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            query = qs.get("q", [""])[0].strip()
+            limit = min(int(qs.get("limit", ["5"])[0]), 20)
+            if not query:
+                self._json_response(400, {"error": "missing ?q="})
+                return
+            try:
+                results = search_notes(query, limit)
+                self._json_response(200, {"query": query, "results": results})
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
+        elif self.path == "/api/reindex/status":
             acquired = _reindex_lock.acquire(blocking=False)
             if acquired:
                 _reindex_lock.release()
