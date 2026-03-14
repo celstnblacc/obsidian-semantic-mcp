@@ -68,7 +68,7 @@ obsidian-semantic-mcp/
 ### 1. Clone
 
 ```bash
-git clone <repo-url> && cd obsidian-semantic-mcp
+git clone https://github.com/celstnblacc/obsidian-semantic-mcp.git && cd obsidian-semantic-mcp
 ```
 
 ### 2. Run the setup wizard
@@ -76,6 +76,8 @@ git clone <repo-url> && cd obsidian-semantic-mcp
 ```bash
 scripts/osm init
 ```
+
+> **Tip:** Run `scripts/osm init --dry-run` first to preview every action without making any changes.
 
 The wizard detects your OS and asks which installation mode you want:
 
@@ -243,7 +245,7 @@ OBSIDIAN_VAULT="/path/to/your/vault" uv run python3 src/dashboard.py
 uv run pytest -q
 ```
 
-Runs 54 fast unit tests covering embedding, search, vault path safety, connection pool, and the osm CLI wizard.
+Runs 183 fast unit tests covering embedding, search, vault path safety, connection pool, and the osm CLI wizard.
 
 ### `test_setup.py` — Prerequisites check (native installs)
 
@@ -285,7 +287,7 @@ If you prefer running without Docker:
 ### 1. Clone and install
 
 ```bash
-git clone <repo-url> && cd obsidian-semantic-mcp
+git clone https://github.com/celstnblacc/obsidian-semantic-mcp.git && cd obsidian-semantic-mcp
 uv sync
 ```
 

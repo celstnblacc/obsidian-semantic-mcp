@@ -18,6 +18,26 @@ os.environ.setdefault("DATABASE_URL", "postgresql://localhost/test")
 os.environ.setdefault("OLLAMA_URL", "http://localhost:11434")
 
 
+def _make_mock_conn():
+    """Return a (fake_db_conn contextmanager, mock_cur) pair for search_vault tests."""
+    from contextlib import contextmanager
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_cur.__enter__ = lambda s: s
+    mock_cur.__exit__ = MagicMock(return_value=False)
+    mock_cur.fetchall.return_value = []
+    mock_conn.__enter__ = lambda s: s
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value = mock_cur
+
+    @contextmanager
+    def fake_db_conn():
+        yield mock_conn
+
+    return fake_db_conn, mock_cur
+
+
 # ── embed() ──────────────────────────────────────────────────────────────────
 
 class TestEmbed:
@@ -89,7 +109,9 @@ class TestWatchdogHandler:
         """Any exception from index_note must be caught — watcher thread must survive."""
         import server
 
-        monkeypatch.setattr(server, "index_note", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        def boom(*a):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(server, "index_note", boom)
 
         with tempfile.NamedTemporaryFile(suffix=".md") as f:
             f.write(b"# test\n")
@@ -137,28 +159,14 @@ class TestIsSystemPath:
 class TestIndexingFlag:
     def test_search_returns_indexing_message_when_in_progress(self, monkeypatch):
         """search_vault with empty DB during indexing must say indexing is in progress, not 'try reindex_vault'."""
-        from contextlib import contextmanager
+        import asyncio
         import server
         import threading
         evt = threading.Event()
         evt.set()
         monkeypatch.setattr(server, "_INDEXING_IN_PROGRESS", evt)
 
-        import asyncio
-
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_cur.__enter__ = lambda s: s
-        mock_cur.__exit__ = MagicMock(return_value=False)
-        mock_cur.fetchall.return_value = []
-        mock_conn.__enter__ = lambda s: s
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        mock_conn.cursor.return_value = mock_cur
-
-        @contextmanager
-        def fake_db_conn():
-            yield mock_conn
-
+        fake_db_conn, _ = _make_mock_conn()
         monkeypatch.setattr(server, "db_conn", fake_db_conn)
         monkeypatch.setattr(server, "embed", lambda q: [0.1, 0.2])
 
@@ -207,32 +215,20 @@ class TestDbConnPoolSafety:
 class TestSearchInputValidation:
     def test_negative_limit_clamped_to_one(self, monkeypatch):
         """search_vault must not pass a negative LIMIT to PostgreSQL."""
-        from contextlib import contextmanager
         import asyncio
         import server
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_cur.__enter__ = lambda s: s
-        mock_cur.__exit__ = MagicMock(return_value=False)
-        mock_cur.fetchall.return_value = []
-        mock_conn.__enter__ = lambda s: s
-        mock_conn.__exit__ = MagicMock(return_value=False)
-        mock_conn.cursor.return_value = mock_cur
-
-        @contextmanager
-        def fake_db_conn():
-            yield mock_conn
-
+        fake_db_conn, mock_cur = _make_mock_conn()
         monkeypatch.setattr(server, "db_conn", fake_db_conn)
         monkeypatch.setattr(server, "embed", lambda q: [0.1])
         monkeypatch.setattr(server, "_INDEXING_IN_PROGRESS", False)
 
         asyncio.run(server.call_tool("search_vault", {"query": "x", "limit": -99}))
 
-        # The SQL executed must contain LIMIT 1, not LIMIT -99
-        sql_call = mock_cur.execute.call_args[0][0]
-        assert "LIMIT 1" in sql_call or "-99" not in sql_call
+        # SQL uses parameterized queries (%s), so the clamped value is in the
+        # params tuple — not the SQL string. Third param is the LIMIT value.
+        params = mock_cur.execute.call_args[0][1]
+        assert params[-1] >= 1, f"LIMIT must be clamped to ≥1, got {params[-1]}"
 
 
 # ── _vec_to_str ───────────────────────────────────────────────────────────────
@@ -255,7 +251,6 @@ class TestBuildDsn:
     def test_prefers_database_url(self, monkeypatch):
         """DATABASE_URL env var takes priority over POSTGRES_* vars."""
         monkeypatch.setenv("DATABASE_URL", "postgresql://custom/db")
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
         import config
         assert config.build_dsn() == "postgresql://custom/db"
 
@@ -267,7 +262,6 @@ class TestBuildDsn:
         monkeypatch.setenv("POSTGRES_DB",   "mydb")
         monkeypatch.setenv("POSTGRES_USER", "myuser")
         monkeypatch.setenv("POSTGRES_PASSWORD", "mypass")
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
         import config
         dsn = config.build_dsn()
         assert "host=myhost" in dsn
@@ -279,7 +273,6 @@ class TestBuildDsn:
     def test_fallback_dsn_has_no_credential_url(self, monkeypatch):
         """The libpq keyword format must never produce a postgresql://user:pass@host URL."""
         monkeypatch.delenv("DATABASE_URL", raising=False)
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
         import config
         assert "://" not in config.build_dsn()
 
@@ -291,7 +284,7 @@ class TestResolveVaultPath:
         import server
         with patch.object(server, "VAULT_PATH", str(tmp_path)):
             result = server._resolve_vault_path("notes/note.md")
-            assert str(result).startswith(str(tmp_path.resolve()))
+            assert Path(result).is_relative_to(tmp_path.resolve())
 
     def test_blocks_dotdot_traversal(self, tmp_path):
         """../../etc/passwd must raise ValueError."""

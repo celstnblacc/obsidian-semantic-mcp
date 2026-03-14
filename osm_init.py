@@ -874,7 +874,7 @@ def cmd_remove():
     header("Removing .env")
     env_path = PROJECT_ROOT / ".env"
     if DRY_RUN:
-        _dry(f"delete {env_path}")
+        _dry(f"remove {env_path}")
     elif env_path.exists():
         env_path.unlink()
         ok(f"Deleted {env_path}")

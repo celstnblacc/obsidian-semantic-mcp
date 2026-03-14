@@ -20,4 +20,4 @@ dev = [
 osm = "osm_init:main"
 
 [tool.pytest.ini_options]
-testpaths = ["tests/test_unit.py", "tests/test_osm_init.py"]
+testpaths = ["tests/test_unit.py", "tests/test_osm_init.py", "tests/test_osm_commands.py"]
