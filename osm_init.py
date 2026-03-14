@@ -116,6 +116,41 @@ def prompt_pg_password():
     return prompt("Postgres password (used for the local Docker DB)", default="obsidian")
 
 
+def prompt_persistent_storage(include_ollama=False):
+    """
+    Ask whether to use bind-mount directories for persistent storage.
+
+    Named Docker volumes are wiped by `docker compose down -v`.
+    Bind mounts survive it — data lives in a host directory the user controls.
+
+    Returns (pgdata_path, ollama_data_path).  Either may be None (named volume).
+    ollama_data_path is only populated when include_ollama=True.
+    """
+    print()
+    print("  Database storage:\n")
+    print("    Named volume  — managed by Docker; wiped by  docker compose down -v")
+    print("    Bind mount    — lives in a local directory; survives  docker compose down -v")
+    print()
+    if not confirm("Use a persistent bind mount? (recommended)", default="y"):
+        return None, None
+
+    default_dir = str(Path.home() / ".local" / "share" / "obsidian-semantic-mcp")
+    raw = prompt("Local data directory", default=default_dir)
+    data_dir = Path(raw).expanduser().resolve()
+
+    pgdata_path      = str(data_dir / "pgdata")
+    ollama_data_path = str(data_dir / "ollama") if include_ollama else None
+
+    for p in filter(None, [pgdata_path, ollama_data_path]):
+        if DRY_RUN:
+            _dry(f"mkdir -p {p}")
+        else:
+            Path(p).mkdir(parents=True, exist_ok=True)
+            ok(f"Data directory: {p}")
+
+    return pgdata_path, ollama_data_path
+
+
 # ── Prerequisite checks ───────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
@@ -236,13 +271,17 @@ def prompt_ssh_credentials():
 
 # ── .env writer (runtime only — gitignored) ───────────────────────────────────
 
-def write_env(vault, pg_password, ollama_url, ssh_params=None):
+def write_env(vault, pg_password, ollama_url, ssh_params=None,
+              pgdata_path=None, ollama_data_path=None):
     """
     Write .env in the project root at runtime. This file is gitignored.
 
     ssh_params, if provided, is a dict with keys:
       user, host, remote_port, local_port, key_path (optional)
     These are stored as OSM_SSH_* vars so `osm tunnel` can reconnect.
+
+    pgdata_path / ollama_data_path, if set, are written as PGDATA_PATH /
+    OLLAMA_DATA_PATH so Docker Compose uses bind mounts instead of named volumes.
     """
     env_path = PROJECT_ROOT / ".env"
     lines = [
@@ -250,6 +289,10 @@ def write_env(vault, pg_password, ollama_url, ssh_params=None):
         f"POSTGRES_PASSWORD={pg_password}",
         f"OLLAMA_URL={ollama_url}",
     ]
+    if pgdata_path:
+        lines.append(f"PGDATA_PATH={pgdata_path}")
+    if ollama_data_path:
+        lines.append(f"OLLAMA_DATA_PATH={ollama_data_path}")
     if ssh_params:
         lines += [
             "",
@@ -440,10 +483,16 @@ def mode_full_docker():
 
     vault = prompt_vault()
     pg_pw = prompt_pg_password()
-    write_env(vault, pg_pw, "http://ollama:11434")
+    pgdata_path, ollama_data_path = prompt_persistent_storage(include_ollama=True)
+    write_env(vault, pg_pw, "http://ollama:11434",
+              pgdata_path=pgdata_path, ollama_data_path=ollama_data_path)
 
     header("Starting all services")
     env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw}
+    if pgdata_path:
+        env["PGDATA_PATH"] = pgdata_path
+    if ollama_data_path:
+        env["OLLAMA_DATA_PATH"] = ollama_data_path
     compose_up(env=env)
     wait_for_postgres()
 
@@ -472,10 +521,13 @@ def mode_docker_host_ollama():
 
     vault = prompt_vault()
     pg_pw = prompt_pg_password()
-    write_env(vault, pg_pw, ollama_url)
+    pgdata_path, _ = prompt_persistent_storage(include_ollama=False)
+    write_env(vault, pg_pw, ollama_url, pgdata_path=pgdata_path)
 
     header("Starting services (postgres, mcp-server, dashboard)")
     env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw, "OLLAMA_URL": ollama_url}
+    if pgdata_path:
+        env["PGDATA_PATH"] = pgdata_path
     compose_up(services=["postgres", "mcp-server", "dashboard"], env=env)
     wait_for_postgres()
 
@@ -574,6 +626,7 @@ def mode_docker_remote_ollama():
 
     # ── Write .env with SSH params for future reconnect ───────────────────────
     pg_pw = prompt_pg_password()
+    pgdata_path, _ = prompt_persistent_storage(include_ollama=False)
     ssh_params = {
         "user":        ssh_user,
         "host":        remote_host,
@@ -581,12 +634,14 @@ def mode_docker_remote_ollama():
         "local_port":  local_tunnel_port,
         "key_path":    key_path,
     }
-    write_env(vault, pg_pw, ollama_url, ssh_params=ssh_params)
+    write_env(vault, pg_pw, ollama_url, ssh_params=ssh_params, pgdata_path=pgdata_path)
 
     # ── Start Docker services ─────────────────────────────────────────────────
     header("Starting services (postgres, mcp-server, dashboard)")
     env = {**os.environ, "OBSIDIAN_VAULT": vault, "POSTGRES_PASSWORD": pg_pw,
            "OLLAMA_URL": ollama_url}
+    if pgdata_path:
+        env["PGDATA_PATH"] = pgdata_path
     compose_up(services=["postgres", "mcp-server", "dashboard"], env=env)
     wait_for_postgres()
 

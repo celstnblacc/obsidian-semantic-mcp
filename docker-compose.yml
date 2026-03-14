@@ -8,7 +8,9 @@ services:
       POSTGRES_USER: obsidian
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PGDATA_PATH: set to an absolute host path for a persistent bind mount,
+      # leave unset to use the named Docker volume (wiped by `down -v`).
+      - ${PGDATA_PATH:-pgdata}:/var/lib/postgresql/data
     ports:
       - "5433:5432"   # 5433 to avoid conflict with host postgres
     healthcheck:
@@ -21,7 +23,9 @@ services:
     image: ollama/ollama:latest
     restart: unless-stopped
     volumes:
-      - ollama_data:/root/.ollama
+      # OLLAMA_DATA_PATH: set to an absolute host path for a persistent bind mount,
+      # leave unset to use the named Docker volume (wiped by `down -v`).
+      - ${OLLAMA_DATA_PATH:-ollama_data}:/root/.ollama
     ports:
       - "11435:11434"  # 11435 to avoid conflict with host ollama
     healthcheck:
