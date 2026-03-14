@@ -46,6 +46,8 @@ from mcp.types import Tool, TextContent
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+from config import build_dsn
+
 
 # ─────────────────────────────────── Config ─────────────────────────────────
 
@@ -53,30 +55,17 @@ VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 
-
-def _build_dsn() -> str:
-    # Prefer a full DATABASE_URL when provided (e.g. native install).
-    # Docker sets individual POSTGRES_* vars so no credential URL appears
-    # in any committed file — psycopg2 accepts libpq keyword format too.
-    if url := os.environ.get("DATABASE_URL"):
-        return url
-    host = os.environ.get("POSTGRES_HOST", "localhost")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    db   = os.environ.get("POSTGRES_DB", "obsidian_brain")
-    user = os.environ.get("POSTGRES_USER", "obsidian")
-    pw   = os.environ.get("POSTGRES_PASSWORD", "")
-    return f"host={host} port={port} dbname={db} user={user} password={pw}"
-
-
-DATABASE_URL = _build_dsn()
+DATABASE_URL = build_dsn()
 
 MAX_EMBED_CHARS = 2000  # nomic-embed-text context limit (approx 512 tokens)
 _TIMESTAMP_FMT  = "%Y-%m-%d %H:%M"
 _DEBOUNCE_SECS  = 0.5   # collapse rapid saves from Obsidian autosave
 
-# Set True during background_init so search_vault can return a useful message
+# Set during background_init so search_vault can return a useful message
 # instead of the misleading "No indexed notes found. Try running reindex_vault."
-_INDEXING_IN_PROGRESS = False
+# threading.Event is used rather than a bare bool to avoid any cross-thread
+# visibility issues without relying on the GIL.
+_INDEXING_IN_PROGRESS = threading.Event()
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -107,12 +96,21 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
 
 @contextlib.contextmanager
 def db_conn():
-    """Acquire a connection from the pool and return it on exit."""
+    """Acquire a connection from the pool and return it on exit.
+
+    On exception the connection is discarded (close=True) so any open
+    transaction is rolled back and the pool gets a fresh connection next time.
+    """
     pool = _get_pool()
     conn = pool.getconn()
     try:
         yield conn
-    finally:
+    except Exception:
+        # Return the connection as broken so the pool replaces it rather than
+        # recycling a connection that may have an aborted transaction.
+        pool.putconn(conn, close=True)
+        raise
+    else:
         pool.putconn(conn)
 
 
@@ -302,9 +300,8 @@ def start_watcher(vault: str) -> Observer:
 
 def background_init(vault: str):
     """Full index + start watcher — runs in a background thread at startup."""
-    global _INDEXING_IN_PROGRESS
     time.sleep(1)  # give the MCP server a moment to start
-    _INDEXING_IN_PROGRESS = True
+    _INDEXING_IN_PROGRESS.set()
     try:
         init_db()
         index_vault(vault)
@@ -312,20 +309,25 @@ def background_init(vault: str):
     except Exception as e:
         log.error("Background init failed: %s", e)
     finally:
-        _INDEXING_IN_PROGRESS = False
+        _INDEXING_IN_PROGRESS.clear()
 
 
 # ─────────────────────────── Shutdown Handler ────────────────────────────────
 
-def _shutdown(signum, _frame):
-    """Stop the watcher and close the DB pool before exiting."""
-    log.info("Shutting down (signal %d)…", signum)
+def _shutdown():
+    """Stop the watcher and close the DB pool, then cancel the event loop.
+
+    Called via loop.add_signal_handler() so it runs on the event loop thread,
+    making it safe to call asyncio-adjacent code without deadlocking.
+    Blocking operations (observer.join) are intentionally absent — the daemon
+    thread will be killed when the process exits.
+    """
+    log.info("Shutting down…")
     if _observer is not None:
         _observer.stop()
-        _observer.join(timeout=5)
     if _pool is not None:
         _pool.closeall()
-    sys.exit(0)
+    asyncio.get_event_loop().stop()
 
 
 # ──────────────────────────── Vault Filesystem Helpers ───────────────────────
@@ -535,13 +537,13 @@ async def call_tool(name: str, arguments: dict):
     # ── search_vault ──────────────────────────────────────────────────────────
     if name == "search_vault":
         query = arguments.get("query", "").strip()
-        limit = min(int(arguments.get("limit", 5)), 20)
+        limit = max(1, min(int(arguments.get("limit", 5)), 20))
 
         if not query:
             return [TextContent(type="text", text="Please provide a search query.")]
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             vec = await loop.run_in_executor(None, embed, query)
             vec_str = _vec_to_str(vec)
 
@@ -558,7 +560,7 @@ async def call_tool(name: str, arguments: dict):
                         rows = cur.fetchall()
 
             if not rows:
-                if _INDEXING_IN_PROGRESS:
+                if _INDEXING_IN_PROGRESS.is_set():
                     return [TextContent(
                         type="text",
                         text="Vault indexing is in progress — no results yet. Try again in a moment.",
@@ -715,8 +717,8 @@ async def call_tool(name: str, arguments: dict):
     elif name == "simple_search":
         try:
             query = arguments.get("query", "").strip()
-            limit = min(int(arguments.get("limit", 10)), 50)
-            ctx_len = int(arguments.get("context_length", 100))
+            limit = max(1, min(int(arguments.get("limit", 10)), 50))
+            ctx_len = max(1, int(arguments.get("context_length", 100)))
             if not query:
                 return [TextContent(type="text", text="Please provide a search query.")]
 
@@ -805,8 +807,9 @@ async def main():
         log.error("OBSIDIAN_VAULT is not set. Export it before running.")
         sys.exit(1)
 
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGTERM, _shutdown)
+    loop.add_signal_handler(signal.SIGINT, _shutdown)
 
     # Full index + watcher starts in background — server is immediately ready
     threading.Thread(

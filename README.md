@@ -45,8 +45,10 @@ obsidian-semantic-mcp/
 │   ├── server.py          # MCP server — semantic search + vault CRUD (10 tools)
 │   └── dashboard.py       # Monitoring dashboard (http://localhost:8484)
 ├── tests/
-│   ├── test_setup.py      # Prerequisites checker (deps, DB, Ollama)
-│   └── test_e2e.py        # End-to-end MCP protocol test
+│   ├── test_unit.py       # Unit tests (54 tests, no real DB/Ollama needed)
+│   ├── test_osm_init.py   # Unit tests for the osm CLI wizard
+│   ├── test_setup.py      # Prerequisites checker (deps, DB, Ollama) — run directly
+│   └── test_e2e.py        # End-to-end MCP protocol test — run directly
 ├── osm_init.py            # Interactive setup wizard (used by scripts/osm)
 ├── Dockerfile             # Python 3.13 + uv
 ├── docker-compose.yml     # Full stack: postgres, ollama, server, dashboard
@@ -235,19 +237,25 @@ OBSIDIAN_VAULT="/path/to/your/vault" uv run python3 src/dashboard.py
 
 ## Testing
 
-Two test scripts are included (for native installs):
+### Unit tests (no real DB or Ollama needed)
 
-### `test_setup.py` — Prerequisites check
+```bash
+uv run pytest -q
+```
 
-Verifies Python deps, vault path, PostgreSQL + pgvector, Ollama, and embedding smoke test.
+Runs 54 fast unit tests covering embedding, search, vault path safety, connection pool, and the osm CLI wizard.
+
+### `test_setup.py` — Prerequisites check (native installs)
+
+Verifies Python deps, vault path, PostgreSQL + pgvector, Ollama, and embedding smoke test. Run directly — not via pytest.
 
 ```bash
 OBSIDIAN_VAULT="/path/to/your/vault" uv run python3 tests/test_setup.py
 ```
 
-### `test_e2e.py` — End-to-end MCP test
+### `test_e2e.py` — End-to-end MCP test (native installs)
 
-Launches the server, initializes MCP protocol, waits for indexing, runs semantic search, and verifies results.
+Launches the server, initializes MCP protocol, waits for indexing, runs semantic search, and verifies results. Run directly — not via pytest.
 
 ```bash
 OBSIDIAN_VAULT="/path/to/your/vault" uv run python3 tests/test_e2e.py

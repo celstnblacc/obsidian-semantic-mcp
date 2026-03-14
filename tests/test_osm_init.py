@@ -15,11 +15,17 @@ import osm_init
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+_ORIGINAL_PROJECT_ROOT = osm_init.PROJECT_ROOT
+
+
 def _reset():
     """Reset global mutable state between tests."""
     osm_init.DRY_RUN = False
     osm_init._DRY_ACTIONS.clear()
     osm_init._PARAMS.clear()
+    # Restore PROJECT_ROOT so a test that crashes mid-_with_root() doesn't
+    # leave subsequent tests pointing at a cleaned-up tmp_path.
+    osm_init.PROJECT_ROOT = _ORIGINAL_PROJECT_ROOT
 
 
 # ── _parse_flags ──────────────────────────────────────────────────────────────
@@ -65,12 +71,12 @@ class TestParseFlags:
 
     def test_ssh_flags(self):
         _, params = osm_init._parse_flags([
-            "--ssh-host", "10.0.0.5",
+            "--ssh-host", "203.0.113.5",
             "--ssh-user", "ubuntu",
             "--ssh-port", "11434",
             "--ssh-key",  "/path/to/key",
         ])
-        assert params["ssh_host"] == "10.0.0.5"
+        assert params["ssh_host"] == "203.0.113.5"
         assert params["ssh_user"] == "ubuntu"
         assert params["ssh_port"] == "11434"
         assert params["ssh_key"]  == "/path/to/key"

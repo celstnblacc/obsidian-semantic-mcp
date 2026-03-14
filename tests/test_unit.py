@@ -139,7 +139,10 @@ class TestIndexingFlag:
         """search_vault with empty DB during indexing must say indexing is in progress, not 'try reindex_vault'."""
         from contextlib import contextmanager
         import server
-        monkeypatch.setattr(server, "_INDEXING_IN_PROGRESS", True)
+        import threading
+        evt = threading.Event()
+        evt.set()
+        monkeypatch.setattr(server, "_INDEXING_IN_PROGRESS", evt)
 
         import asyncio
 
@@ -165,6 +168,73 @@ class TestIndexingFlag:
         assert "reindex_vault" not in text
 
 
+# ── db_conn pool safety ───────────────────────────────────────────────────────
+
+class TestDbConnPoolSafety:
+    def test_connection_discarded_on_exception(self, monkeypatch):
+        """When the body of db_conn() raises, putconn must be called with close=True
+        so the pool discards the connection rather than recycling a broken one."""
+        import server
+
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_pool.getconn.return_value = mock_conn
+        monkeypatch.setattr(server, "_pool", mock_pool)
+
+        with pytest.raises(RuntimeError):
+            with server.db_conn():
+                raise RuntimeError("simulated mid-transaction failure")
+
+        mock_pool.putconn.assert_called_once_with(mock_conn, close=True)
+
+    def test_connection_returned_normally_on_success(self, monkeypatch):
+        """On clean exit putconn must be called without close=True."""
+        import server
+
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_pool.getconn.return_value = mock_conn
+        monkeypatch.setattr(server, "_pool", mock_pool)
+
+        with server.db_conn():
+            pass
+
+        mock_pool.putconn.assert_called_once_with(mock_conn)
+
+
+# ── input validation — limit / context_length ─────────────────────────────────
+
+class TestSearchInputValidation:
+    def test_negative_limit_clamped_to_one(self, monkeypatch):
+        """search_vault must not pass a negative LIMIT to PostgreSQL."""
+        from contextlib import contextmanager
+        import asyncio
+        import server
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.__enter__ = lambda s: s
+        mock_cur.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = []
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = mock_cur
+
+        @contextmanager
+        def fake_db_conn():
+            yield mock_conn
+
+        monkeypatch.setattr(server, "db_conn", fake_db_conn)
+        monkeypatch.setattr(server, "embed", lambda q: [0.1])
+        monkeypatch.setattr(server, "_INDEXING_IN_PROGRESS", False)
+
+        asyncio.run(server.call_tool("search_vault", {"query": "x", "limit": -99}))
+
+        # The SQL executed must contain LIMIT 1, not LIMIT -99
+        sql_call = mock_cur.execute.call_args[0][0]
+        assert "LIMIT 1" in sql_call or "-99" not in sql_call
+
+
 # ── _vec_to_str ───────────────────────────────────────────────────────────────
 
 class TestVecToStr:
@@ -185,8 +255,9 @@ class TestBuildDsn:
     def test_prefers_database_url(self, monkeypatch):
         """DATABASE_URL env var takes priority over POSTGRES_* vars."""
         monkeypatch.setenv("DATABASE_URL", "postgresql://custom/db")
-        import server
-        assert server._build_dsn() == "postgresql://custom/db"
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        import config
+        assert config.build_dsn() == "postgresql://custom/db"
 
     def test_falls_back_to_postgres_vars(self, monkeypatch):
         """When DATABASE_URL is absent, assembles DSN from POSTGRES_* vars."""
@@ -196,8 +267,9 @@ class TestBuildDsn:
         monkeypatch.setenv("POSTGRES_DB",   "mydb")
         monkeypatch.setenv("POSTGRES_USER", "myuser")
         monkeypatch.setenv("POSTGRES_PASSWORD", "mypass")
-        import server
-        dsn = server._build_dsn()
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        import config
+        dsn = config.build_dsn()
         assert "host=myhost" in dsn
         assert "port=5433" in dsn
         assert "dbname=mydb" in dsn
@@ -207,8 +279,9 @@ class TestBuildDsn:
     def test_fallback_dsn_has_no_credential_url(self, monkeypatch):
         """The libpq keyword format must never produce a postgresql://user:pass@host URL."""
         monkeypatch.delenv("DATABASE_URL", raising=False)
-        import server
-        assert "://" not in server._build_dsn()
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        import config
+        assert "://" not in config.build_dsn()
 
 
 # ── _resolve_vault_path ───────────────────────────────────────────────────────

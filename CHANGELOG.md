@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
 - Docker Compose stack (postgres, ollama, mcp-server, dashboard) with healthchecks
 - Auto-pull of `nomic-embed-text` model on first `docker compose up`
 - Root entry point `obsidian_semantic_mcp.py` for Claude Desktop native config
-- 12 unit tests (`tests/test_unit.py`)
+- 54 unit tests (`tests/test_unit.py`, `tests/test_osm_init.py`)
 
 ### Fixed
 - Empty Ollama embedding (`[]`) now raises `ValueError` instead of inserting invalid vector

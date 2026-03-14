@@ -18,7 +18,7 @@ docker compose down -v
 ## Test
 
 ```bash
-uv run pytest tests/ -q
+uv run pytest -q
 ```
 
 ## Key Commands

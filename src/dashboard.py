@@ -19,70 +19,56 @@ from pathlib import Path
 import psycopg2
 import requests
 
+from config import build_dsn
+
 VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 DASH_PORT   = int(os.environ.get("DASHBOARD_PORT", "8484"))
 
-
-def _build_dsn() -> str:
-    # Prefer a full DATABASE_URL when provided (e.g. native install).
-    # Docker sets individual POSTGRES_* vars so no credential URL appears
-    # in any committed file — psycopg2 accepts libpq keyword format too.
-    if url := os.environ.get("DATABASE_URL"):
-        return url
-    host = os.environ.get("POSTGRES_HOST", "localhost")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    db   = os.environ.get("POSTGRES_DB", "obsidian_brain")
-    user = os.environ.get("POSTGRES_USER", "obsidian")
-    pw   = os.environ.get("POSTGRES_PASSWORD", "")
-    return f"host={host} port={port} dbname={db} user={user} password={pw}"
-
-
-DATABASE_URL = _build_dsn()
+DATABASE_URL = build_dsn()
 
 
 def _get_db_stats(stats: dict) -> None:
     conn = psycopg2.connect(DATABASE_URL)
     try:
-        cur = conn.cursor()
-        stats["db_ok"] = True
+        with conn.cursor() as cur:
+            stats["db_ok"] = True
 
-        cur.execute("SELECT version();")
-        stats["pg_version"] = cur.fetchone()[0].split(",")[0]
+            cur.execute("SELECT version();")
+            stats["pg_version"] = cur.fetchone()[0].split(",")[0]
 
-        cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector';")
-        row = cur.fetchone()
-        stats["pgvector_version"] = row[0] if row else "not installed"
+            cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector';")
+            row = cur.fetchone()
+            stats["pgvector_version"] = row[0] if row else "not installed"
 
-        cur.execute("SELECT COUNT(*), MAX(indexed_at), MIN(indexed_at) FROM notes;")
-        count, last, oldest = cur.fetchone()
-        stats["indexed_count"] = count or 0
-        stats["last_indexed"] = last.isoformat() if last else None
-        stats["oldest_indexed"] = oldest.isoformat() if oldest else None
+            cur.execute("SELECT COUNT(*), MAX(indexed_at), MIN(indexed_at) FROM notes;")
+            count, last, oldest = cur.fetchone()
+            stats["indexed_count"] = count or 0
+            stats["last_indexed"] = last.isoformat() if last else None
+            stats["oldest_indexed"] = oldest.isoformat() if oldest else None
 
-        cur.execute("SELECT pg_total_relation_size('notes');")
-        size = cur.fetchone()[0]
-        stats["db_size_bytes"] = size
-        if size < 1024:
-            stats["db_size_human"] = f"{size} B"
-        elif size < 1024 * 1024:
-            stats["db_size_human"] = f"{size / 1024:.1f} KB"
-        else:
-            stats["db_size_human"] = f"{size / (1024 * 1024):.1f} MB"
+            cur.execute("SELECT pg_total_relation_size('notes');")
+            size = cur.fetchone()[0]
+            stats["db_size_bytes"] = size
+            if size < 1024:
+                stats["db_size_human"] = f"{size} B"
+            elif size < 1024 * 1024:
+                stats["db_size_human"] = f"{size / 1024:.1f} KB"
+            else:
+                stats["db_size_human"] = f"{size / (1024 * 1024):.1f} MB"
 
-        cur.execute(
-            "SELECT path, indexed_at FROM notes ORDER BY indexed_at DESC LIMIT 10;"
-        )
-        for path, ts in cur.fetchall():
-            try:
-                rel = str(Path(path).relative_to(VAULT_PATH)) if VAULT_PATH else path
-            except ValueError:
-                rel = path
-            stats["recent_notes"].append(
-                {"path": rel, "indexed_at": ts.strftime("%Y-%m-%d %H:%M")}
+            cur.execute(
+                "SELECT path, indexed_at FROM notes ORDER BY indexed_at DESC LIMIT 10;"
             )
-        cur.close()
+            for path, ts in cur.fetchall():
+                try:
+                    rel = str(Path(path).relative_to(VAULT_PATH)) if VAULT_PATH else path
+                except ValueError:
+                    rel = path
+                stats["recent_notes"].append(
+                    {"path": rel, "indexed_at": ts.strftime("%Y-%m-%d %H:%M")}
+                )
     finally:
         conn.close()
 

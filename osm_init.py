@@ -188,7 +188,7 @@ def check_docker():
     if not cmd_exists("docker"):
         fail("Docker not found — install Docker Desktop: https://docs.docker.com/get-docker/")
         return False
-    r = run("docker info", check=False, capture=True)
+    r = run(["docker", "info"], check=False, capture=True)
     if r.returncode != 0:
         fail("Docker daemon is not running — start Docker Desktop first")
         return False
@@ -197,7 +197,7 @@ def check_docker():
 
 
 def check_compose():
-    r = run("docker compose version", check=False, capture=True)
+    r = run(["docker", "compose", "version"], check=False, capture=True)
     if r.returncode != 0:
         fail("docker compose v2 not found — upgrade Docker Desktop")
         return False
@@ -243,6 +243,10 @@ def open_ssh_tunnel(user, host, remote_port, local_port, key_path=None):
     Uses -o ExitOnForwardFailure so the ssh process exits immediately if
     binding fails, instead of silently hanging.
     """
+    # StrictHostKeyChecking=accept-new trusts the host key on first connection
+    # and rejects changed keys on subsequent connections. This is vulnerable to
+    # MITM on the very first connection. If the remote host key is known, add it
+    # to $HOME/.ssh/known_hosts before running osm init to eliminate this window.
     cmd = [
         "ssh",
         "-N", "-f",                          # background, no remote command
@@ -346,6 +350,7 @@ def write_env(vault, pg_password, ollama_url, ssh_params=None,
         print()
         return
     env_path.write_text("\n".join(lines))
+    env_path.chmod(0o600)  # contains POSTGRES_PASSWORD — owner-only read/write
     ok(f"Wrote {env_path}")
 
 
@@ -373,12 +378,13 @@ def update_claude_config(entry):
         except json.JSONDecodeError:
             warn(f"Could not parse {path} — mcpServers section will be reset")
     cfg.setdefault("mcpServers", {})["obsidian-semantic"] = entry
-    pretty = json.dumps({"mcpServers": {"obsidian-semantic": entry}}, indent=2)
+    # Show the full merged config so the user can see what other entries are preserved
+    pretty = json.dumps(cfg, indent=2)
     if DRY_RUN:
-        _dry(f"write {path}", "contents shown below")
+        _dry(f"write {path}", "merged config shown below")
         print()
-        for l in pretty.splitlines():
-            print(f"    {_c('90', l)}")
+        for line in pretty.splitlines():
+            print(f"    {_c('90', line)}")
         print()
         return
     path.write_text(json.dumps(cfg, indent=2) + "\n")
@@ -410,14 +416,16 @@ def _native_entry(vault, db_url):
 
 # ── Docker compose helpers ────────────────────────────────────────────────────
 
-def compose(cmd, env=None):
-    full = f"docker compose --project-directory {PROJECT_ROOT} {cmd}"
-    return run(full, env=env)
+def compose(args, env=None):
+    return run(
+        ["docker", "compose", "--project-directory", str(PROJECT_ROOT)] + args,
+        env=env,
+    )
 
 
 def compose_up(services=None, env=None):
-    svc = " ".join(services) if services else ""
-    compose(f"up -d {svc}".strip(), env=env)
+    args = ["up", "-d"] + (list(services) if services else [])
+    compose(args, env=env)
 
 
 def wait_for_postgres(timeout=90):
@@ -425,8 +433,8 @@ def wait_for_postgres(timeout=90):
     deadline = time.time() + timeout
     while time.time() < deadline:
         r = run(
-            f"docker compose --project-directory {PROJECT_ROOT} exec -T postgres "
-            "pg_isready -U obsidian -d obsidian_brain",
+            ["docker", "compose", "--project-directory", str(PROJECT_ROOT),
+             "exec", "-T", "postgres", "pg_isready", "-U", "obsidian", "-d", "obsidian_brain"],
             check=False, capture=True,
         )
         if r.returncode == 0:
@@ -454,16 +462,16 @@ def mode_native_macos():
     header("PostgreSQL + pgvector")
     if not cmd_exists("psql"):
         info("Installing postgresql@17 and pgvector via Homebrew…")
-        run("brew install postgresql@17 pgvector")
-        run("brew services start postgresql@17")
+        run(["brew", "install", "postgresql@17", "pgvector"])
+        run(["brew", "services", "start", "postgresql@17"])
         time.sleep(3)
     else:
         ok("psql already installed")
 
-    r = run("psql postgres -lqt", check=False, capture=True)
+    r = run(["psql", "postgres", "-lqt"], check=False, capture=True)
     if "obsidian_brain" not in (r.stdout or ""):
-        run("createdb obsidian_brain")
-        run('psql obsidian_brain -c "CREATE EXTENSION IF NOT EXISTS vector;"')
+        run(["createdb", "obsidian_brain"])
+        run(["psql", "obsidian_brain", "-c", "CREATE EXTENSION IF NOT EXISTS vector;"])
         ok("Created database: obsidian_brain")
     else:
         ok("Database obsidian_brain already exists")
@@ -474,7 +482,7 @@ def mode_native_macos():
     header("Ollama + embedding model")
     if not cmd_exists("ollama"):
         info("Installing ollama via Homebrew…")
-        run("brew install ollama")
+        run(["brew", "install", "ollama"])
 
     if not check_ollama_at("localhost"):
         info("Starting ollama serve in background…")
@@ -489,7 +497,7 @@ def mode_native_macos():
             time.sleep(2)
 
     info("Pulling nomic-embed-text (first run may take a few minutes)…")
-    run("ollama pull nomic-embed-text")
+    run(["ollama", "pull", "nomic-embed-text"])
     ok("Model ready: nomic-embed-text")
 
     # ── Python env ────────────────────────────────────────────────────────────
@@ -497,7 +505,7 @@ def mode_native_macos():
     if not cmd_exists("uv"):
         fail("uv not found — install from https://github.com/astral-sh/uv")
         sys.exit(1)
-    run(f"uv sync --project {PROJECT_ROOT}")
+    run(["uv", "sync", "--project", str(PROJECT_ROOT)])
     ok("Dependencies installed in .venv")
 
     # ── Claude Desktop config ─────────────────────────────────────────────────
@@ -798,7 +806,7 @@ def cmd_status():
     hr()
 
     r = run(
-        f"docker compose --project-directory {PROJECT_ROOT} ps --format table",
+        ["docker", "compose", "--project-directory", str(PROJECT_ROOT), "ps", "--format", "table"],
         check=False, capture=True,
     )
     if r.returncode == 0 and r.stdout.strip():
@@ -827,7 +835,7 @@ def cmd_status():
 def cmd_rebuild():
     header("Rebuilding Docker images")
     hr()
-    compose("up -d --build mcp-server dashboard")
+    compose(["up", "-d", "--build", "mcp-server", "dashboard"])
     ok("Rebuild complete")
     info("Dashboard:  http://localhost:8484")
 
@@ -851,13 +859,14 @@ def cmd_remove():
     # ── Docker services + volumes ─────────────────────────────────────────────
     header("Stopping Docker services")
     r = run(
-        f"docker compose --project-directory {PROJECT_ROOT} ps -q",
+        ["docker", "compose", "--project-directory", str(PROJECT_ROOT), "ps", "-q"],
         check=False, capture=True,
     )
     if not DRY_RUN and not (r.stdout or "").strip():
         info("No running Docker services found — skipping")
     else:
-        run(f"docker compose --project-directory {PROJECT_ROOT} down -v", check=False)
+        run(["docker", "compose", "--project-directory", str(PROJECT_ROOT), "down", "-v"],
+            check=False)
         if not DRY_RUN:
             ok("Docker services stopped and volumes removed")
 
@@ -990,7 +999,7 @@ def cmd_help():
     print(f"    scripts/osm init --mode 3 --vault /path/to/vault \\")
     print(f"        --pg-password secret --persistent               # Non-interactive full Docker")
     print(f"    scripts/osm init --mode 4 --vault /path/to/vault \\")
-    print(f"        --ssh-host 10.0.0.5 --ssh-user ubuntu \\")
+    print(f"        --ssh-host 203.0.113.5 --ssh-user ubuntu \\")
     print(f"        --ssh-key $HOME/.ssh/id_ed25519                 # Remote Ollama via SSH")
     print(f"    scripts/osm status                                  # Check service health")
     print(f"    scripts/osm tunnel                                  # Reconnect SSH tunnel")
