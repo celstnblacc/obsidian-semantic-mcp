@@ -127,9 +127,7 @@ def prompt_vault():
         if valid:
             ok(msg)
         else:
-            warn(msg)
-            if not confirm("Continue anyway?", default="n"):
-                sys.exit(0)
+            warn(msg)  # --vault flag implies user intent; warn but don't block
         return str(p)
     existing = os.environ.get("OBSIDIAN_VAULT", "")
     print()
@@ -140,9 +138,7 @@ def prompt_vault():
             if valid:
                 ok(msg)
             else:
-                warn(msg)
-                if not confirm("Continue anyway?", default="n"):
-                    sys.exit(0)
+                warn(msg)  # warn only; user explicitly chose to re-use this path
             return existing
     while True:
         raw = prompt("Absolute path to your Obsidian vault")
@@ -152,9 +148,7 @@ def prompt_vault():
             if valid:
                 ok(msg)
             else:
-                warn(msg)
-                if not confirm("Continue anyway?", default="n"):
-                    continue
+                warn(msg)  # warn only; user just typed this path, trust their intent
             return str(p)
         fail(f"Directory not found: {p}")
 
