@@ -18,6 +18,44 @@ AI assistants forget everything between sessions. You repeat context, lose conti
 
 No cloud services. No API keys. Everything runs locally.
 
+## Using with Claude
+
+Once the MCP server is connected, Claude can access your vault directly — no special syntax needed. Just talk to it naturally.
+
+### Example prompts
+
+```
+"Search my notes for anything about project X"
+"What did I write about ketosis last month?"
+"Find my notes on the Zettelkasten method"
+"Read my Daily/2026-03-14.md note"
+"Append this meeting summary to my inbox note"
+"Write a new note at Projects/obsidian-mcp.md with this content"
+"List all files in my Fleeting folder"
+"Show me what's been modified recently"
+"Re-index my vault"
+```
+
+Claude will automatically choose the right MCP tool (`search_vault`, `get_file`, `write_file`, etc.) based on your request.
+
+### osm — Setup & management CLI
+
+Use `osm` to set up, manage, and tear down the stack. The wizard installs all prerequisites, configures Docker, and updates Claude Desktop automatically.
+
+| Command | Description |
+|---------|-------------|
+| `osm init` | Interactive setup wizard |
+| `osm init --mode <1-4> --vault <path>` | Non-interactive setup (agent/script friendly) |
+| `osm init --dry-run` | Preview all actions without making any changes |
+| `osm status` | Check service health (Docker, Ollama, Claude Desktop) |
+| `osm rebuild` | Rebuild Docker images after a code change |
+| `osm tunnel` | Reconnect SSH tunnel (remote Ollama mode) |
+| `osm remove` | Stop services and wipe all volumes and config |
+| `osm remove --yes` | Non-interactive teardown (agent/script friendly) |
+| `osm help` | Full flag reference |
+
+**`osm init` flags:** `--mode`, `--vault`, `--pg-password`, `--persistent` / `--no-persistent`, `--data-dir`, `--ssh-host`, `--ssh-user`, `--ssh-port`, `--ssh-key`, `--vault-remote`
+
 ## Architecture
 
 ```

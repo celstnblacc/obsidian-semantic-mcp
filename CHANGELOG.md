@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] — 2026-03-14
+
 ### Added
 - 183 unit tests covering server, osm CLI wizard, and all user-facing decision paths
 - `tests/test_osm_commands.py` — 129 tests for every osm command and install mode
@@ -14,6 +18,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Non-interactive `osm init` flags (`--mode`, `--vault`, `--pg-password`, `--persistent`, etc.) for script/agent use
 - `--dry-run` flag — preview all actions without making any changes
 - `osm remove` command — stop services, wipe volumes and config
+- README "Using with Claude" section — example prompts and osm CLI command reference
 
 ### Fixed
 - README test count updated to reflect current suite (183 tests)
