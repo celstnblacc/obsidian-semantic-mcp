@@ -13,6 +13,7 @@ import http.server
 import json
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import psycopg2
 import requests
 
 from config import build_dsn
+from server import index_vault
 
 VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -27,6 +29,8 @@ EMBED_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 DASH_PORT   = int(os.environ.get("DASHBOARD_PORT", "8484"))
 
 DATABASE_URL = build_dsn()
+
+_reindex_lock = threading.Lock()
 
 
 def _get_db_stats(stats: dict) -> None:
@@ -196,6 +200,10 @@ HTML_PAGE = """<!DOCTYPE html>
   .btn:hover { opacity: 0.85; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-danger { background: #ef4444; color: #fff; }
+  .btn-standalone { margin-left: 0; }
+  .actions-row {
+    display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap;
+  }
   .hidden { display: none; }
   @media (max-width: 600px) {
     .grid { grid-template-columns: 1fr 1fr; }
@@ -211,6 +219,11 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="status"><span class="dot" id="dot-db"></span><span id="lbl-db">PostgreSQL</span></div>
   <div class="status"><span class="dot" id="dot-ollama"></span><span id="lbl-ollama">Ollama</span><button class="btn hidden" id="btn-ollama" onclick="startOllama()">Start</button></div>
   <div class="status"><span class="dot" id="dot-model"></span><span id="lbl-model">Embedding Model</span></div>
+</div>
+
+<div class="actions-row">
+  <button class="btn btn-standalone" id="btn-reindex" onclick="triggerReindex(false)">Re-index</button>
+  <button class="btn btn-standalone btn-danger" id="btn-rebuild" onclick="triggerReindex(true)">Clear &amp; Rebuild</button>
 </div>
 
 <div class="grid">
@@ -327,6 +340,24 @@ async function fetchStats() {
   }
 }
 
+async function triggerReindex(full) {
+  if (full && !confirm('Delete all embeddings and re-index from scratch?')) return;
+  const id = full ? 'btn-rebuild' : 'btn-reindex';
+  const label = full ? 'Clear & Rebuild' : 'Re-index';
+  const btn = document.getElementById(id);
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    const r = await fetch(full ? '/api/reindex/full' : '/api/reindex', { method: 'POST' });
+    const d = await r.json();
+    btn.textContent = d.ok ? 'Running…' : ('Failed: ' + (d.message || ''));
+    if (d.ok) setTimeout(fetchStats, 3000);
+  } catch (e) {
+    btn.textContent = 'Error';
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 10000);
+}
+
 async function startOllama() {
   const btn = document.getElementById('btn-ollama');
   btn.disabled = true;
@@ -382,6 +413,34 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._json_response(200, {"ok": True, "message": "ollama serve started"})
             except Exception as e:
                 self._json_response(500, {"ok": False, "message": str(e)})
+
+        elif self.path in ("/api/reindex", "/api/reindex/full"):
+            if not VAULT_PATH:
+                self._json_response(400, {"ok": False, "message": "OBSIDIAN_VAULT not set"})
+                return
+            if not _reindex_lock.acquire(blocking=False):
+                self._json_response(409, {"ok": False, "message": "Re-index already in progress"})
+                return
+
+            full = self.path == "/api/reindex/full"
+
+            def _run():
+                try:
+                    if full:
+                        conn = psycopg2.connect(DATABASE_URL)
+                        try:
+                            with conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("DELETE FROM notes;")
+                        finally:
+                            conn.close()
+                    index_vault(VAULT_PATH)
+                finally:
+                    _reindex_lock.release()
+
+            threading.Thread(target=_run, daemon=True).start()
+            self._json_response(200, {"ok": True, "message": "started"})
+
         else:
             self._json_response(404, {"error": "not found"})
 
