@@ -21,7 +21,7 @@ import psycopg2
 import requests
 
 from config import build_dsn
-from server import index_vault
+from server import db_conn, index_vault
 
 VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -205,6 +205,17 @@ HTML_PAGE = """<!DOCTYPE html>
     display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap;
   }
   .hidden { display: none; }
+  .indexing-banner {
+    background: #1e3a5f; border: 1px solid #3b82f6; border-radius: 8px;
+    padding: 10px 16px; margin-bottom: 24px; font-size: 0.85rem; color: #93c5fd;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .spinner {
+    width: 14px; height: 14px; border: 2px solid #3b82f6;
+    border-top-color: transparent; border-radius: 50%;
+    animation: spin 0.8s linear infinite; flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   @media (max-width: 600px) {
     .grid { grid-template-columns: 1fr 1fr; }
   }
@@ -224,6 +235,11 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="actions-row">
   <button class="btn btn-standalone" id="btn-reindex" onclick="triggerReindex(false)">Re-index</button>
   <button class="btn btn-standalone btn-danger" id="btn-rebuild" onclick="triggerReindex(true)">Clear &amp; Rebuild</button>
+</div>
+
+<div class="indexing-banner hidden" id="indexing-banner">
+  <div class="spinner"></div>
+  <span>Indexing in progress — stats will update on completion</span>
 </div>
 
 <div class="grid">
@@ -340,6 +356,22 @@ async function fetchStats() {
   }
 }
 
+function pollReindexDone(id, label) {
+  fetch('/api/reindex/status').then(r => r.json()).then(d => {
+    if (!d.busy) {
+      const btn = document.getElementById(id);
+      btn.disabled = false;
+      btn.textContent = label;
+      document.getElementById('indexing-banner').classList.add('hidden');
+      fetchStats();
+    } else {
+      setTimeout(() => pollReindexDone(id, label), 3000);
+    }
+  }).catch(() => {
+    setTimeout(() => pollReindexDone(id, label), 5000);
+  });
+}
+
 async function triggerReindex(full) {
   if (full && !confirm('Delete all embeddings and re-index from scratch?')) return;
   const id = full ? 'btn-rebuild' : 'btn-reindex';
@@ -350,12 +382,18 @@ async function triggerReindex(full) {
   try {
     const r = await fetch(full ? '/api/reindex/full' : '/api/reindex', { method: 'POST' });
     const d = await r.json();
-    btn.textContent = d.ok ? 'Running…' : ('Failed: ' + (d.message || ''));
-    if (d.ok) setTimeout(fetchStats, 3000);
+    if (d.ok) {
+      btn.textContent = 'Running…';
+      document.getElementById('indexing-banner').classList.remove('hidden');
+      setTimeout(() => pollReindexDone(id, label), 3000);
+    } else {
+      btn.textContent = 'Failed: ' + (d.message || '');
+      setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 5000);
+    }
   } catch (e) {
     btn.textContent = 'Error';
+    setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 5000);
   }
-  setTimeout(() => { btn.disabled = false; btn.textContent = label; }, 10000);
 }
 
 async function startOllama() {
@@ -391,7 +429,12 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/api/stats":
+        if self.path == "/api/reindex/status":
+            acquired = _reindex_lock.acquire(blocking=False)
+            if acquired:
+                _reindex_lock.release()
+            self._json_response(200, {"busy": not acquired})
+        elif self.path == "/api/stats":
             self._json_response(200, gather_stats())
         else:
             body = HTML_PAGE.encode()
@@ -427,13 +470,10 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             def _run():
                 try:
                     if full:
-                        conn = psycopg2.connect(DATABASE_URL)
-                        try:
+                        with db_conn() as conn:
                             with conn:
                                 with conn.cursor() as cur:
                                     cur.execute("DELETE FROM notes;")
-                        finally:
-                            conn.close()
                     index_vault(VAULT_PATH)
                 finally:
                     _reindex_lock.release()
