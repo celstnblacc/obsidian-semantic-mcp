@@ -216,6 +216,15 @@ def check_ollama_at(host, port=11434):
         return False
 
 
+def _ollama_running_locally(port=11434):
+    """Silent probe — returns True if Ollama answers on localhost, no output."""
+    try:
+        urllib.request.urlopen(f"http://localhost:{port}/api/tags", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
 # ── SSH tunnel helpers ────────────────────────────────────────────────────────
 
 _SSH_KEY_CANDIDATES = [
@@ -1086,6 +1095,15 @@ def cmd_init():
         print(f"    {_c('1', key)})  {_c('1', name)}")
         print(f"         {desc}")
     print()
+
+    if _ollama_running_locally():
+        # macOS mode 2 = Docker + host Ollama; Linux mode 1 = same
+        rec_key = "2" if system == "Darwin" else "1"
+        rec_name = modes[rec_key][0]
+        print(f"  {_c('92', '✓')}  Ollama is already running on this machine.")
+        print(f"     {_c('93', f'Recommended: {rec_key}) {rec_name}')}"
+              f"  — skips the ~3 GB Ollama image pull")
+        print()
 
     choice = prompt("Choose", choices=list(modes.keys()), param_key="mode")
     _, _, handler = modes[choice]
