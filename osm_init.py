@@ -11,9 +11,12 @@ Or via the scripts/osm wrapper:
   scripts/osm init
 """
 
+from __future__ import annotations
+
 import json
 import os
 import platform
+import requests
 import shutil
 import subprocess
 import sys
@@ -120,17 +123,38 @@ def prompt_vault():
             fail(f"Vault not found: {p}")
             sys.exit(1)
         info(f"Vault: {_c('1', str(p))}  (from --vault)")
+        valid, msg = _validate_vault(str(p))
+        if valid:
+            ok(msg)
+        else:
+            warn(msg)
+            if not confirm("Continue anyway?", default="n"):
+                sys.exit(0)
         return str(p)
     existing = os.environ.get("OBSIDIAN_VAULT", "")
     print()
     if existing:
         info(f"OBSIDIAN_VAULT is already set: {existing}")
         if confirm("Use this vault?"):
+            valid, msg = _validate_vault(existing)
+            if valid:
+                ok(msg)
+            else:
+                warn(msg)
+                if not confirm("Continue anyway?", default="n"):
+                    sys.exit(0)
             return existing
     while True:
         raw = prompt("Absolute path to your Obsidian vault")
         p = Path(raw).expanduser().resolve()
         if p.is_dir():
+            valid, msg = _validate_vault(str(p))
+            if valid:
+                ok(msg)
+            else:
+                warn(msg)
+                if not confirm("Continue anyway?", default="n"):
+                    continue
             return str(p)
         fail(f"Directory not found: {p}")
 
@@ -244,6 +268,21 @@ def _default_ssh_key():
     return ""
 
 
+def _test_ssh_connection(host: str, user: str, port: int, key_path: str | None) -> bool:
+    """Test SSH connectivity before launching the tunnel."""
+    cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    if key_path:
+        cmd += ["-i", key_path]
+    if port != 22:
+        cmd += ["-p", str(port)]
+    cmd += [f"{user}@{host}", "echo", "ok"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
 def open_ssh_tunnel(user, host, remote_port, local_port, key_path=None):
     """
     Open an SSH port-forward tunnel in the background:
@@ -313,6 +352,35 @@ def prompt_ssh_credentials():
             info("Using SSH agent or password — you may be prompted by ssh")
 
     return ssh_user, remote_host, int(remote_port), key_path
+
+
+# ── Vault and model helpers ───────────────────────────────────────────────────
+
+def _validate_vault(vault_path: str) -> tuple[bool, str]:
+    """Check that vault path is a valid Obsidian vault."""
+    p = Path(vault_path)
+    if not p.exists():
+        return False, f"Path does not exist: {vault_path}"
+    if not p.is_dir():
+        return False, f"Not a directory: {vault_path}"
+    md_files = list(p.rglob("*.md"))
+    if len(md_files) == 0:
+        return False, f"No .md files found in {vault_path} — is this an Obsidian vault?"
+    return True, f"✓ Found {len(md_files)} markdown files"
+
+
+def _verify_ollama_model(ollama_url: str, model: str) -> bool:
+    """Verify the model is available by running a minimal embedding request."""
+    try:
+        resp = requests.post(
+            f"{ollama_url}/api/embeddings",
+            json={"model": model, "prompt": "test"},
+            timeout=30,
+        )
+        data = resp.json()
+        return bool(data.get("embedding"))
+    except Exception:
+        return False
 
 
 # ── .env writer (runtime only — gitignored) ───────────────────────────────────
@@ -466,7 +534,18 @@ def compose(args, env=None):
 
 def compose_up(services=None, env=None):
     args = ["up", "-d"] + (list(services) if services else [])
-    compose(args, env=env)
+    cmd = ["docker", "compose", "--project-directory", str(PROJECT_ROOT)] + args
+    if DRY_RUN:
+        run(cmd, env=env)
+        return
+    kw: dict = {}
+    if env:
+        kw["env"] = env
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, **kw)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
 
 
 def wait_for_postgres(timeout=90):
@@ -540,6 +619,13 @@ def mode_native_macos():
     info("Pulling nomic-embed-text (first run may take a few minutes)…")
     run(["ollama", "pull", "nomic-embed-text"])
     ok("Model ready: nomic-embed-text")
+    if not DRY_RUN:
+        info("Verifying nomic-embed-text is available…")
+        if _verify_ollama_model("http://localhost:11434", "nomic-embed-text"):
+            ok("nomic-embed-text verified — embeddings responding")
+        else:
+            warn("Model verification failed — embeddings did not respond")
+            info("Try manually:  ollama pull nomic-embed-text")
 
     # ── Python env ────────────────────────────────────────────────────────────
     header("Python environment")
@@ -700,6 +786,18 @@ def mode_docker_remote_ollama():
     local_tunnel_port = 11435
 
     header("SSH tunnel")
+    info(f"Testing SSH connection to {ssh_user}@{remote_host}…")
+    if not DRY_RUN and not _test_ssh_connection(remote_host, ssh_user, 22, key_path):
+        print()
+        fail(f"SSH connection test failed: cannot reach {ssh_user}@{remote_host}:22")
+        print(f"     Check: SSH key path, host reachability, and that SSH is enabled on the remote.")
+        print()
+        if not confirm("Continue anyway?", default="n"):
+            fail("Aborted — fix SSH connectivity and re-run osm init")
+            sys.exit(1)
+    elif not DRY_RUN:
+        ok(f"SSH connection to {ssh_user}@{remote_host} succeeded")
+
     tunnel_ok = open_ssh_tunnel(ssh_user, remote_host, remote_port,
                                 local_tunnel_port, key_path)
     if tunnel_ok:
