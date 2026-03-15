@@ -79,7 +79,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      OBSIDIAN_VAULT: /vault
+      OBSIDIAN_VAULT: /vault   # single-vault default
+      # OBSIDIAN_VAULTS: /vault1,/vault2  # multi-vault: mount each path below
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: obsidian_brain
@@ -89,6 +90,7 @@ services:
       EMBEDDING_MODEL: nomic-embed-text
     volumes:
       - ${OBSIDIAN_VAULT:-.}:/vault:ro
+      # - /path/to/vault2:/vault2:ro  # add for multi-vault
     # stdio transport — Claude Desktop connects via `docker exec`
     stdin_open: true
     healthcheck:
@@ -118,7 +120,8 @@ services:
         condition: service_healthy
     command: ["python3", "src/dashboard.py"]
     environment:
-      OBSIDIAN_VAULT: /vault
+      OBSIDIAN_VAULT: /vault   # single-vault default
+      # OBSIDIAN_VAULTS: /vault1,/vault2  # multi-vault: mount each path below
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DB: obsidian_brain
@@ -129,6 +132,7 @@ services:
       DASHBOARD_PORT: ${DASHBOARD_PORT:-8484}
     volumes:
       - ${OBSIDIAN_VAULT:-.}:/vault:ro
+      # - /path/to/vault2:/vault2:ro  # add for multi-vault
     ports:
       - "${DASHBOARD_PORT:-8484}:8484"
     deploy:

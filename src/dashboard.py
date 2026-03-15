@@ -23,9 +23,9 @@ from urllib.parse import urlparse, parse_qs
 import requests
 
 from config import build_dsn
-from server import db_conn, embed, index_vault, _vec_to_str, _relative
+from server import db_conn, embed, index_vault, _vec_to_str, _relative, VAULT_PATHS
 
-VAULT_PATH  = os.environ.get("OBSIDIAN_VAULT", "")
+VAULT_PATH  = VAULT_PATHS[0] if VAULT_PATHS else ""
 OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 DASH_PORT   = int(os.environ.get("DASHBOARD_PORT", "8484"))
@@ -39,28 +39,89 @@ _ollama_cache: tuple[dict, float] | None = None
 _ollama_cache_lock = threading.Lock()
 _OLLAMA_CACHE_TTL = 10.0  # seconds
 
+# Orphan check cache — counting missing files requires O(n) filesystem calls;
+# cache for 5 minutes to avoid blocking the stats endpoint on every refresh.
+_orphan_cache: tuple[int, float] | None = None
+_orphan_cache_lock = threading.Lock()
+_ORPHAN_CACHE_TTL = 300.0  # seconds
 
-def search_notes(query: str, limit: int = 5, min_similarity: float = 0.0) -> list[dict]:
-    """Embed query and return top-N results as list of {path, preview, similarity}."""
-    vec_str = _vec_to_str(embed(query))
+
+def search_notes(
+    query: str,
+    limit: int = 5,
+    min_similarity: float = 0.0,
+    mode: str = "hybrid",
+    vault: str | None = None,
+) -> list[dict]:
+    """Search indexed notes. mode: 'hybrid' | 'semantic' | 'keyword'. vault: filter by vault name."""
+    if mode not in ("hybrid", "semantic", "keyword"):
+        mode = "hybrid"
+
+    # Resolve vault filter to full path(s)
+    vault_ids: list[str] | None = None
+    if vault:
+        vault_ids = [v for v in VAULT_PATHS
+                     if v == vault or os.path.basename(v) == vault]
+
+    vault_clause = "AND vault_id = ANY(%s)" if vault_ids else ""
+    vault_param  = (vault_ids,) if vault_ids else ()
+
+    # Compute the embedding BEFORE acquiring a DB connection — embed() can block
+    # for up to EMBED_TIMEOUT seconds and must never hold a pool slot.
+    vec_str: str | None = None
+    if mode != "keyword":
+        vec_str = _vec_to_str(embed(query))
+
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT path, content,
-                       1 - (embedding <=> %s::vector) AS similarity
-                FROM notes
-                WHERE 1 - (embedding <=> %s::vector) >= %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """, (vec_str, vec_str, min_similarity, vec_str, limit))
+            if mode == "keyword":
+                cur.execute(f"""
+                    SELECT path, content,
+                           ts_rank(content_tsv, plainto_tsquery('english', %s)) AS similarity
+                    FROM notes
+                    WHERE content_tsv @@ plainto_tsquery('english', %s)
+                    {vault_clause}
+                    ORDER BY similarity DESC
+                    LIMIT %s
+                """, (query, query) + vault_param + (limit,))
+            else:
+                assert vec_str is not None
+                if mode == "semantic":
+                    cur.execute(f"""
+                        SELECT path, content,
+                               1 - (embedding <=> %s::vector) AS similarity
+                        FROM notes
+                        WHERE 1 - (embedding <=> %s::vector) >= %s
+                        {vault_clause}
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """, (vec_str, vec_str, min_similarity) + vault_param + (vec_str, limit))
+                else:  # hybrid
+                    cur.execute(f"""
+                        SELECT path, content,
+                               (1 - (embedding <=> %s::vector)) * 0.7 +
+                               COALESCE(ts_rank(content_tsv,
+                                   plainto_tsquery('english', %s)), 0) * 0.3
+                               AS similarity
+                        FROM notes
+                        WHERE (1 - (embedding <=> %s::vector)) * 0.7 +
+                              COALESCE(ts_rank(content_tsv,
+                                  plainto_tsquery('english', %s)), 0) * 0.3 >= %s
+                        {vault_clause}
+                        ORDER BY similarity DESC
+                        LIMIT %s
+                    """, (vec_str, query, vec_str, query, min_similarity) + vault_param + (limit,))
             rows = cur.fetchall()
+
     results = []
     for path, content, sim in rows:
+        if sim < min_similarity:
+            continue
         preview = content[:400].strip()
         while "\n\n\n" in preview:
             preview = preview.replace("\n\n\n", "\n\n")
         results.append({
-            "path": str(_relative(Path(path))),
+            "path": _relative(Path(path)),
             "content": content or "",
             "preview": preview,
             "similarity": round(float(sim), 3),
@@ -108,15 +169,23 @@ def _get_db_stats(stats: dict) -> None:
                     {"path": rel, "indexed_at": ts.strftime("%Y-%m-%d %H:%M")}
                 )
 
-            # Count orphaned embeddings (in DB but not on filesystem)
+            # Fetch paths for orphan check outside the cursor — filesystem calls
+            # happen after the DB connection is released (see below).
             cur.execute("SELECT path FROM notes")
             all_paths = [row[0] for row in cur.fetchall()]
-            vault_path = os.environ.get("OBSIDIAN_VAULT", "")
-            orphaned = sum(
-                1 for p in all_paths
-                if not os.path.exists(os.path.join(vault_path, p) if vault_path else p)
-            )
-            stats["orphaned_embeddings"] = orphaned
+
+    # O(n) filesystem check — cached for _ORPHAN_CACHE_TTL to avoid blocking
+    # the stats endpoint on every 30-second dashboard refresh.
+    global _orphan_cache
+    now = time.monotonic()
+    orphaned: int
+    with _orphan_cache_lock:
+        if _orphan_cache is not None and now < _orphan_cache[1]:
+            orphaned = _orphan_cache[0]
+        else:
+            orphaned = sum(1 for p in all_paths if not os.path.exists(p))
+            _orphan_cache = (orphaned, now + _ORPHAN_CACHE_TTL)
+    stats["orphaned_embeddings"] = orphaned
 
 
 def _get_vault_stats(stats: dict) -> None:
@@ -394,6 +463,18 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="text" id="search-query" placeholder="Enter search query..." />
     </label>
     <label>
+      Mode
+      <select id="search-mode">
+        <option value="hybrid" selected>Hybrid</option>
+        <option value="semantic">Semantic</option>
+        <option value="keyword">Keyword</option>
+      </select>
+    </label>
+    <label id="vault-label" style="display:none">
+      Vault
+      <select id="search-vault"><option value="">All vaults</option></select>
+    </label>
+    <label>
       Limit
       <input type="number" id="search-limit" value="5" min="1" max="20" />
     </label>
@@ -544,7 +625,11 @@ async function testSearch() {
   if (!q) return;
   const limit = document.getElementById('search-limit').value;
   const minSim = document.getElementById('search-min-sim').value;
-  const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}&min_similarity=${minSim}`);
+  const mode = document.getElementById('search-mode').value;
+  const vault = document.getElementById('search-vault').value;
+  let url = `/api/search?q=${encodeURIComponent(q)}&limit=${limit}&min_similarity=${minSim}&mode=${mode}`;
+  if (vault) url += `&vault=${encodeURIComponent(vault)}`;
+  const res = await fetch(url);
   const data = await res.json();
   const div = document.getElementById('search-results');
   if (!data.results || data.results.length === 0) {
@@ -559,7 +644,24 @@ async function testSearch() {
   `).join('');
 }
 
+async function fetchVaults() {
+  try {
+    const r = await fetch('/api/vaults');
+    const d = await r.json();
+    if (!d.vaults || d.vaults.length <= 1) return;
+    const sel = document.getElementById('search-vault');
+    d.vaults.forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v.name;
+      opt.textContent = v.name;
+      sel.appendChild(opt);
+    });
+    document.getElementById('vault-label').style.display = '';
+  } catch (e) { /* single-vault — keep hidden */ }
+}
+
 fetchStats();
+fetchVaults();
 setInterval(fetchStats, 30000);
 </script>
 </body>
@@ -577,25 +679,31 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if self.path.startswith("/api/search"):
-            qs = parse_qs(urlparse(self.path).query)
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/search":
+            qs = parse_qs(parsed.query)
             query = qs.get("q", [""])[0].strip()
             limit = min(int(qs.get("limit", ["5"])[0]), 20)
             min_similarity = float(qs.get("min_similarity", ["0.0"])[0])
+            mode = qs.get("mode", ["hybrid"])[0]
+            vault = qs.get("vault", [""])[0].strip() or None
             if not query:
                 self._json_response(400, {"error": "missing ?q="})
                 return
             try:
-                results = search_notes(query, limit, min_similarity)
-                self._json_response(200, {"query": query, "results": results})
+                results = search_notes(query, limit, min_similarity, mode, vault)
+                self._json_response(200, {"query": query, "mode": mode, "vault": vault, "results": results})
             except Exception as e:
                 self._json_response(500, {"error": str(e)})
-        elif self.path == "/api/reindex/status":
+        elif parsed.path == "/api/vaults":
+            vaults = [{"name": os.path.basename(v), "path": v} for v in VAULT_PATHS]
+            self._json_response(200, {"vaults": vaults})
+        elif parsed.path == "/api/reindex/status":
             acquired = _reindex_lock.acquire(blocking=False)
             if acquired:
                 _reindex_lock.release()
             self._json_response(200, {"busy": not acquired})
-        elif self.path == "/api/stats":
+        elif parsed.path == "/api/stats":
             self._json_response(200, gather_stats())
         else:
             body = HTML_PAGE.encode()
@@ -606,7 +714,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_POST(self) -> None:
-        if self.path == "/api/ollama/start":
+        path = urlparse(self.path).path
+        if path == "/api/ollama/start":
             try:
                 subprocess.Popen(
                     ["ollama", "serve"],
@@ -618,15 +727,15 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._json_response(500, {"ok": False, "message": str(e)})
 
-        elif self.path in ("/api/reindex", "/api/reindex/full"):
-            if not VAULT_PATH:
-                self._json_response(400, {"ok": False, "message": "OBSIDIAN_VAULT not set"})
+        elif path in ("/api/reindex", "/api/reindex/full"):
+            if not VAULT_PATHS:
+                self._json_response(400, {"ok": False, "message": "No vault configured"})
                 return
             if not _reindex_lock.acquire(blocking=False):
                 self._json_response(409, {"ok": False, "message": "Re-index already in progress"})
                 return
 
-            full = self.path == "/api/reindex/full"
+            full = path == "/api/reindex/full"
 
             def _run():
                 try:
@@ -635,7 +744,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                             with conn:
                                 with conn.cursor() as cur:
                                     cur.execute("DELETE FROM notes;")
-                    index_vault(VAULT_PATH)
+                    for vp in VAULT_PATHS:
+                        index_vault(vp)
                 finally:
                     _reindex_lock.release()
 

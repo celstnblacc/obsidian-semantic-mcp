@@ -120,27 +120,85 @@ class TestWatchdogHandler:
             handler._handle_upsert(f.name)  # must not raise
 
 
+# ── index_note connection safety ──────────────────────────────────────────────
+
+class TestIndexNoteConnectionSafety:
+    """Regression: index_note must NOT hold a DB connection while calling embed().
+    The embed() call can block for up to EMBED_TIMEOUT (15s). With a pool of 5,
+    concurrent file saves would exhaust the pool and starve search/hash queries.
+    """
+
+    def test_hash_check_connection_released_before_embed_and_upsert(self, monkeypatch):
+        """The hash-check DB connection must be fully released before _embed_and_upsert
+        is invoked. The embed() call (inside _embed_and_upsert) can block for up to
+        EMBED_TIMEOUT seconds; holding the hash-check connection across it exhausts the
+        pool under concurrent file-save activity.
+        """
+        import server
+        from contextlib import contextmanager
+
+        call_order: list[str] = []
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.__enter__ = lambda s: s
+        mock_cur.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchone.return_value = None  # no existing hash → proceeds to upsert
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = mock_cur
+
+        @contextmanager
+        def fake_db_conn():
+            call_order.append("db_open")
+            try:
+                yield mock_conn
+            finally:
+                call_order.append("db_close")
+
+        def fake_embed_and_upsert(path, content, h, vault_id=""):
+            call_order.append("embed_and_upsert")
+
+        monkeypatch.setattr(server, "db_conn", fake_db_conn)
+        monkeypatch.setattr(server, "_embed_and_upsert", fake_embed_and_upsert)
+        # Prevent Ollama calls in the broken pre-fix state (current code calls embed
+        # directly inside the db_conn block; after the fix it delegates to _embed_and_upsert)
+        monkeypatch.setattr(server, "embed", lambda text: [0.1, 0.2])
+
+        server.index_note("/vault/note.md", "# Note content", "vault")
+
+        assert "embed_and_upsert" in call_order, "_embed_and_upsert was never called"
+        close_idx = call_order.index("db_close")
+        upsert_idx = call_order.index("embed_and_upsert")
+        assert close_idx < upsert_idx, (
+            f"Hash-check DB connection was not released before _embed_and_upsert: {call_order}"
+        )
+
+
 # ── _is_system_path ───────────────────────────────────────────────────────────
 
 class TestIsSystemPath:
     def test_skips_obsidian_dir(self, tmp_path):
         """Files inside .obsidian should be skipped."""
         import server
-        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+        with patch.object(server, "VAULT_PATH", str(tmp_path)), \
+             patch.object(server, "_VAULT_LIST", [str(tmp_path)]):
             p = tmp_path / ".obsidian" / "config.json"
             assert server._is_system_path(p) is True
 
     def test_skips_trash(self, tmp_path):
         """Files inside .trash should be skipped."""
         import server
-        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+        with patch.object(server, "VAULT_PATH", str(tmp_path)), \
+             patch.object(server, "_VAULT_LIST", [str(tmp_path)]):
             p = tmp_path / ".trash" / "deleted.md"
             assert server._is_system_path(p) is True
 
     def test_does_not_skip_normal_note(self, tmp_path):
         """Regular notes should not be skipped."""
         import server
-        with patch.object(server, "VAULT_PATH", str(tmp_path)):
+        with patch.object(server, "VAULT_PATH", str(tmp_path)), \
+             patch.object(server, "_VAULT_LIST", [str(tmp_path)]):
             p = tmp_path / "notes" / "my_note.md"
             assert server._is_system_path(p) is False
 
@@ -149,7 +207,8 @@ class TestIsSystemPath:
         hidden_vault = tmp_path / ".vaults" / "my_vault"
         hidden_vault.mkdir(parents=True)
         import server
-        with patch.object(server, "VAULT_PATH", str(hidden_vault)):
+        with patch.object(server, "VAULT_PATH", str(hidden_vault)), \
+             patch.object(server, "_VAULT_LIST", [str(hidden_vault)]):
             p = hidden_vault / "notes" / "note.md"
             assert server._is_system_path(p) is False
 
@@ -321,3 +380,134 @@ class TestFileHash:
     def test_returns_string(self):
         import server
         assert isinstance(server.file_hash("x"), str)
+
+    def test_sha256_not_md5(self):
+        """Regression: index_vault must use file_hash (SHA-256), not hashlib.md5().
+        If both hash the same content, they must produce the same value — otherwise
+        every file appears 'changed' on every reindex.
+        """
+        import hashlib
+        import server
+
+        content = "# Test Note\nSome content"
+        sha256_hex = hashlib.sha256(content.encode()).hexdigest()
+        md5_hex = hashlib.md5(content.encode()).hexdigest()
+
+        result = server.file_hash(content)
+        assert result == sha256_hex, "file_hash must use SHA-256"
+        assert result != md5_hex, "file_hash must NOT use MD5 (would cause reindex on every run)"
+
+
+# ── index_vault hash consistency ─────────────────────────────────────────────
+
+class TestIndexVaultHashConsistency:
+    """Regression test: index_vault must use file_hash() for change detection,
+    not a different algorithm (e.g. hashlib.md5). A mismatch would cause every
+    file to appear 'changed' on every reindex.
+    """
+
+    def test_index_vault_skips_unchanged_file(self, tmp_path, monkeypatch):
+        """A file already indexed with file_hash() must be skipped on reindex."""
+        import server
+
+        content = "# Note\nUnchanged content"
+        note = tmp_path / "note.md"
+        note.write_text(content, encoding="utf-8")
+
+        expected_hash = server.file_hash(content)
+
+        # Simulate DB already having this file with the correct SHA-256 hash
+        fake_db_conn, mock_cur = _make_mock_conn()
+        mock_cur.fetchall.return_value = [(str(note), expected_hash)]
+
+        embed_calls: list[str] = []
+
+        def fake_embed_and_upsert(path, content, hash_, vault):
+            embed_calls.append(path)
+
+        monkeypatch.setattr(server, "_bulk_load_hashes", lambda paths: {str(note): expected_hash})
+        monkeypatch.setattr(server, "_embed_and_upsert", fake_embed_and_upsert)
+        monkeypatch.setattr(server, "_should_skip_path", lambda p: False)
+
+        server.index_vault(str(tmp_path))
+
+        assert embed_calls == [], (
+            "Unchanged file was re-embedded — hash algorithm mismatch between "
+            "index_vault() and file_hash()"
+        )
+
+    def test_index_vault_reindexes_changed_file(self, tmp_path, monkeypatch):
+        """A file whose content changed must be re-embedded."""
+        import server
+
+        content = "# Note\nNew content"
+        note = tmp_path / "note.md"
+        note.write_text(content, encoding="utf-8")
+
+        stale_hash = server.file_hash("# Note\nOld content")  # different from current
+
+        embed_calls: list[str] = []
+
+        def fake_embed_and_upsert(path, content, hash_, vault):
+            embed_calls.append(path)
+
+        monkeypatch.setattr(server, "_bulk_load_hashes", lambda paths: {str(note): stale_hash})
+        monkeypatch.setattr(server, "_embed_and_upsert", fake_embed_and_upsert)
+        monkeypatch.setattr(server, "_should_skip_path", lambda p: False)
+
+        server.index_vault(str(tmp_path))
+
+        assert str(note) in embed_calls, "Changed file must be re-embedded"
+
+
+# ── dashboard search_notes connection safety ──────────────────────────────────
+
+class TestDashboardSearchConnectionSafety:
+    """Regression: dashboard search_notes must NOT call embed() while holding a DB connection.
+    Holding the connection during an Ollama HTTP call (up to 15s) starves the pool.
+    """
+
+    def test_embed_called_before_db_connection_opened(self, monkeypatch):
+        """embed() must be called and complete before any db_conn is acquired."""
+        from contextlib import contextmanager
+
+        # dashboard imports server, so it's already in sys.modules after test_unit imports
+        import dashboard
+        import server
+
+        call_order: list[str] = []
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.__enter__ = lambda s: s
+        mock_cur.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchall.return_value = []
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value = mock_cur
+
+        @contextmanager
+        def fake_db_conn():
+            call_order.append("db_open")
+            try:
+                yield mock_conn
+            finally:
+                call_order.append("db_close")
+
+        def fake_embed(text):
+            call_order.append("embed")
+            return [0.1, 0.2, 0.3]
+
+        monkeypatch.setattr(server, "db_conn", fake_db_conn)
+        monkeypatch.setattr(dashboard, "db_conn", fake_db_conn)
+        monkeypatch.setattr(server, "embed", fake_embed)
+        monkeypatch.setattr(dashboard, "embed", fake_embed)
+
+        dashboard.search_notes("test query", mode="hybrid")
+
+        assert "embed" in call_order, "embed() was never called"
+        embed_idx = call_order.index("embed")
+        db_open_idx = call_order.index("db_open")
+        assert embed_idx < db_open_idx, (
+            f"embed() was called after db_conn was opened — pool starvation risk: {call_order}"
+        )

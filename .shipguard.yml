@@ -11,6 +11,7 @@ exclude_paths:
   - "**/fixtures/**"
   - "**/__snapshots__/**"
   - "osm_init.py"  # setup wizard — no SQL; PY-007 false-positives on bash-launcher f-strings
+  - ".claude/**"   # local worktree snapshots — not production code
 
 # Rule IDs to disable
 disable_rules: []

@@ -78,7 +78,7 @@ Your Obsidian vault ($HOME/.obsidian)
 ```
 obsidian-semantic-mcp/
 ├── scripts/
-│   └── osm                # CLI wrapper — run `scripts/osm init` to set up
+│   └── osm                # CLI wrapper — `uv run osm init` or `scripts/osm init`
 ├── src/
 │   ├── server.py          # MCP server — semantic search + vault CRUD (10 tools)
 │   └── dashboard.py       # Monitoring dashboard (http://localhost:8484)
@@ -109,13 +109,16 @@ obsidian-semantic-mcp/
 git clone https://github.com/celstnblacc/obsidian-semantic-mcp.git && cd obsidian-semantic-mcp
 ```
 
-### 2. Run the setup wizard
+### 2. Install dependencies and run the setup wizard
 
 ```bash
-scripts/osm init
+uv sync
+uv run osm init
 ```
 
-> **Tip:** Run `scripts/osm init --dry-run` first to preview every action without making any changes.
+> **Tip:** Run `uv run osm init --dry-run` first to preview every action without making any changes.
+>
+> `scripts/osm` is a direct wrapper — if you prefer not to use `uv run`, `scripts/osm init` works identically without activating the venv.
 
 The wizard detects your OS and asks which installation mode you want:
 
@@ -229,7 +232,7 @@ deploy:
 | `get_file` | Read the full content of a single file. |
 | `get_files_batch` | Read multiple files at once. |
 | `append_content` | Append content to a file (creates if missing). |
-| `write_file` | Write or overwrite a file in the vault. |
+| `write_file` | **Overwrites** the target file completely — existing content is replaced with no undo. Use `append_content` if you want to add to an existing file instead. |
 | `recent_changes` | Get recently modified files. |
 
 ### Index Management
@@ -239,9 +242,29 @@ deploy:
 | `list_indexed_notes` | List all indexed notes with their last indexed timestamp. |
 | `reindex_vault` | Force a full re-index of all notes. Runs in the background. |
 
+## Multi-Vault Support
+
+To index multiple vaults, set `OBSIDIAN_VAULTS` to a comma-separated list of absolute paths:
+
+```bash
+OBSIDIAN_VAULTS="/path/to/vault1,/path/to/vault2" docker compose up -d
+```
+
+Or in docker-compose.yml (uncomment the multi-vault lines):
+
+```yaml
+environment:
+  OBSIDIAN_VAULTS: /vault1,/vault2   # multi-vault
+volumes:
+  - /path/to/vault1:/vault1:ro
+  - /path/to/vault2:/vault2:ro
+```
+
+When using multiple vaults, the `search_vault` MCP tool gains a `vault` parameter to filter results by vault name. The dashboard also shows a vault selector. Each vault is watched and indexed independently.
+
 ## How It Works
 
-1. **Indexing** — On startup, the server walks your vault, reads each `.md` file, generates a 768-dim embedding via Ollama, and upserts it into PostgreSQL with pgvector. Unchanged files (same SHA-256 hash) are skipped.
+1. **Indexing** — On startup, the server walks your vault, reads each `.md` file, generates a 768-dim embedding via Ollama, and upserts it into PostgreSQL with pgvector. Unchanged files (same SHA-256 hash) are skipped on subsequent runs. **First-run indexing takes roughly 1–2 seconds per note** with a local Ollama instance — expect 5–15 minutes for a 500-note vault. Watch progress at http://localhost:8484 or via `docker compose logs -f mcp-server`.
 2. **Watching** — A file watcher (`watchdog`) monitors the vault for creates, updates, deletes, and moves — re-embedding changed files automatically.
 3. **Searching** — When Claude calls `search_vault`, the query is embedded and matched against stored vectors using cosine similarity (IVFFlat index). The top results are returned with similarity scores and content previews.
 4. **CRUD** — All file operations use direct filesystem access, so the server works whether Obsidian is open or not. Path traversal outside the vault is blocked.
@@ -251,6 +274,7 @@ deploy:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `OBSIDIAN_VAULT` | Absolute path to your Obsidian vault | *required* |
+| `OBSIDIAN_VAULTS` | Comma-separated list of vault paths for multi-vault mode. Overrides `OBSIDIAN_VAULT` when set. | — |
 | `POSTGRES_PASSWORD` | PostgreSQL password (Docker) | *required for Docker* |
 | `DATABASE_URL` | Full connection string (overrides POSTGRES_* vars) | built from POSTGRES_* vars |
 | `POSTGRES_HOST` | PostgreSQL host | `localhost` |
@@ -259,6 +283,9 @@ deploy:
 | `POSTGRES_USER` | Database user | `obsidian` |
 | `OLLAMA_URL` | Ollama API endpoint | `http://localhost:11434` |
 | `EMBEDDING_MODEL` | Ollama model for embeddings | `nomic-embed-text` |
+| `EMBED_WORKERS` | Parallel threads for bulk indexing | `4` |
+| `RERANK_MODEL` | Optional Ollama model for cross-encoder re-ranking (e.g. `llama3.2`). Disabled when empty. | — |
+| `RERANK_CANDIDATES` | Candidate pool size fetched before re-ranking | `20` |
 
 ## Monitoring Dashboard
 
@@ -285,7 +312,7 @@ OBSIDIAN_VAULT="/path/to/your/vault" uv run python3 src/dashboard.py
 uv run pytest -q
 ```
 
-Runs 183 fast unit tests covering embedding, search, vault path safety, connection pool, and the osm CLI wizard.
+Runs 188 fast unit tests covering embedding, search, vault path safety, connection pool, and the osm CLI wizard.
 
 ### `test_setup.py` — Prerequisites check (native installs)
 
