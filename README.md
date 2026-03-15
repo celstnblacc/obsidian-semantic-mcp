@@ -20,13 +20,14 @@ No cloud services. No API keys. Everything runs locally.
 
 ## Quick Start
 
-### 1. Add to Claude
+This guide uses **Docker** (recommended for all platforms). Prefer running natively? Jump to [Native Install (macOS)](#native-install-macos).
 
-```bash
-claude mcp add obsidian-semantic -- docker exec -i obsidian-semantic-mcp-mcp-server-1 python3 src/server.py
-```
+**Before you start:**
+- **`uv`** must be installed — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Docker Desktop** must be installed and running
+- Know your vault path — in Obsidian: Settings → About → Vault location
 
-### 2. Clone and run the setup wizard
+### 1. Clone and run the setup wizard
 
 ```bash
 git clone https://github.com/celstnblacc/obsidian-semantic-mcp.git && cd obsidian-semantic-mcp
@@ -55,15 +56,40 @@ The wizard detects your OS and asks which installation mode you want:
   3)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
 ```
 
+> **Which mode?** Pick **Full Docker** (mode 3 on macOS, mode 2 on Linux) unless you already have Ollama running locally — in that case pick **Docker + host Ollama** to avoid re-downloading the ~7GB model.
+
 It then:
 - Installs prerequisites (Homebrew packages or Docker images)
 - Pulls `nomic-embed-text` if needed
 - Writes a `.env` file (gitignored) with your vault path and credentials
 - Updates `claude_desktop_config.json` automatically
 
-### 3. Restart Claude Desktop
+### 2. Add to Claude Code
 
-The server indexes your vault on first run, then watches for changes automatically. Open the dashboard at http://localhost:8484 to monitor progress.
+```bash
+claude mcp add obsidian-semantic -- docker exec -i obsidian-semantic-mcp-mcp-server-1 python3 src/server.py
+```
+
+### 3. Add to Claude Desktop
+
+Add to `$HOME/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "obsidian-semantic": {
+      "command": "docker",
+      "args": ["exec", "-i", "obsidian-semantic-mcp-mcp-server-1", "python3", "src/server.py"]
+    }
+  }
+}
+```
+
+### 4. Restart Claude Desktop
+
+The server indexes your vault on first run, then watches for changes automatically.
+
+> **First-run indexing takes roughly 1–2 seconds per note** — expect 5–15 minutes for a 500-note vault. Monitor progress at http://localhost:8484. Claude will return no results until indexing completes.
 
 > Prefer running without Docker? See [Native Install (macOS)](#native-install-macos).
 > Want to skip the wizard? See [Manual start](#manual-start-without-wizard).
@@ -170,7 +196,7 @@ PostgreSQL + pgvector (vector storage + IVFFlat index)
     ↓
 Ollama / nomic-embed-text (local 768-dim embeddings)
     ↓
-Your Obsidian vault ($HOME/.obsidian)
+Your Obsidian vault (e.g. $HOME/Documents/MyVault)
 ```
 
 ## Project Structure
@@ -320,6 +346,9 @@ OBSIDIAN_VAULT="/path/to/your/vault" uv run python3 tests/test_e2e.py
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
+| `uv: command not found` | `uv` not installed or not in PATH | Run `curl -LsSf https://astral.sh/uv/install.sh \| sh` then restart your terminal |
+| `Cannot connect to the Docker daemon` | Docker Desktop not running | Start Docker Desktop from Applications (macOS) or system tray (Windows/Linux) |
+| `Permission denied: /path/to/vault` | Vault path not readable by Docker | On macOS: Docker Desktop → Settings → Resources → File Sharing — add your vault path |
 | `ModuleNotFoundError: No module named 'mcp'` | System Python instead of venv | Use `.venv/bin/python3` in config, or use Docker |
 | `ModuleNotFoundError: No module named 'psycopg2'` in Docker | Container built before venv PATH fix | `docker compose up -d --build mcp-server` |
 | `Search returns 0 results` | IVFFlat index built on empty table | Run `psql obsidian_brain -c "REINDEX INDEX notes_embedding_idx;"` |
