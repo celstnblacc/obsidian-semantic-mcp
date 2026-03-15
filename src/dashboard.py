@@ -246,6 +246,10 @@ def gather_stats() -> dict:
         "orphaned_embeddings": 0,
         "ollama_ok": False,
         "model_loaded": False,
+        # True only in native mode (localhost) — Docker modes can't run `ollama serve`
+        # inside the container, so the Start button is hidden for non-local Ollama URLs.
+        "can_start_ollama": "localhost" in OLLAMA_URL,
+        "reindex_busy": False,
         "recent_notes": [],
         "pg_version": "—",
         "pgvector_version": "—",
@@ -265,6 +269,11 @@ def gather_stats() -> dict:
         _get_ollama_stats(stats)
     except Exception as e:
         stats["ollama_error"] = str(e)
+
+    acquired = _reindex_lock.acquire(blocking=False)
+    if acquired:
+        _reindex_lock.release()
+    stats["reindex_busy"] = not acquired
 
     return stats
 
@@ -339,7 +348,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .actions-row {
     display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap;
   }
-  .hidden { display: none; }
+  .hidden { display: none !important; }
   .indexing-banner {
     background: #1e3a5f; border: 1px solid #3b82f6; border-radius: 8px;
     padding: 10px 16px; margin-bottom: 24px; font-size: 0.85rem; color: #93c5fd;
@@ -516,7 +525,7 @@ async function fetchStats() {
       s.db_ok ? 'PostgreSQL' : 'PostgreSQL — DOWN';
     document.getElementById('lbl-ollama').textContent =
       s.ollama_ok ? 'Ollama' : 'Ollama — DOWN';
-    document.getElementById('btn-ollama').classList.toggle('hidden', s.ollama_ok);
+    document.getElementById('btn-ollama').classList.toggle('hidden', s.ollama_ok || !s.can_start_ollama);
     document.getElementById('lbl-model').textContent =
       s.model_loaded ? 'nomic-embed-text' : 'Model — NOT LOADED';
 
@@ -555,6 +564,12 @@ async function fetchStats() {
         row.appendChild(timeEl);
         list.appendChild(row);
       });
+    }
+
+    // Keep banner in sync with actual reindex state — prevents it getting
+    // stuck visible after a container restart or page reload.
+    if (!s.reindex_busy) {
+      document.getElementById('indexing-banner').classList.add('hidden');
     }
 
     document.getElementById('footer').textContent =
