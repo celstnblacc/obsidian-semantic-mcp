@@ -18,6 +18,106 @@ AI assistants forget everything between sessions. You repeat context, lose conti
 
 No cloud services. No API keys. Everything runs locally.
 
+## Quick Start
+
+### 1. Add to Claude
+
+```bash
+claude mcp add obsidian-semantic -- docker exec -i obsidian-semantic-mcp-mcp-server-1 python3 src/server.py
+```
+
+### 2. Clone and run the setup wizard
+
+```bash
+git clone https://github.com/celstnblacc/obsidian-semantic-mcp.git && cd obsidian-semantic-mcp
+uv sync
+uv run osm init
+```
+
+> **Tip:** Run `uv run osm init --dry-run` first to preview every action without making any changes.
+>
+> `scripts/osm` is a direct wrapper — if you prefer not to use `uv run`, `scripts/osm init` works identically without activating the venv.
+
+The wizard detects your OS and asks which installation mode you want:
+
+**macOS:**
+```
+  1)  Native              Homebrew + local Postgres + local Ollama
+  2)  Docker + host Ollama    Postgres in Docker, Ollama already on this Mac
+  3)  Full Docker         Everything in containers  (recommended)
+  4)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
+```
+
+**Linux:**
+```
+  1)  Docker + host Ollama    Postgres in Docker, Ollama on this machine
+  2)  Full Docker         Everything in containers  (recommended)
+  3)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
+```
+
+It then:
+- Installs prerequisites (Homebrew packages or Docker images)
+- Pulls `nomic-embed-text` if needed
+- Writes a `.env` file (gitignored) with your vault path and credentials
+- Updates `claude_desktop_config.json` automatically
+
+### 3. Restart Claude Desktop
+
+The server indexes your vault on first run, then watches for changes automatically. Open the dashboard at http://localhost:8484 to monitor progress.
+
+> Prefer running without Docker? See [Native Install (macOS)](#native-install-macos).
+> Want to skip the wizard? See [Manual start](#manual-start-without-wizard).
+
+---
+
+### Manual start (without wizard)
+
+```bash
+OBSIDIAN_VAULT="/path/to/your/vault" POSTGRES_PASSWORD=obsidian docker compose up -d
+```
+
+> Docker Compose also reads a `.env` file in the repo root (gitignored).
+
+First run pulls all images and the `nomic-embed-text` model automatically. This starts:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| PostgreSQL + pgvector | 5433 | Vector storage (avoids conflict with host pg) |
+| Ollama | 11435 | Local embeddings (auto-pulls model) |
+| MCP server | stdio | Claude Desktop connects via `docker exec` |
+| Dashboard | 8484 | http://localhost:8484 |
+
+### Useful commands
+
+```bash
+# View server logs
+docker compose logs -f mcp-server
+
+# Rebuild after code changes
+docker compose up -d --build mcp-server dashboard
+
+# Stop everything
+docker compose down
+
+# Stop and wipe all data (re-index from scratch)
+# ⚠️  WARNING: -v deletes all indexed embeddings. Re-indexing will restart from scratch.
+docker compose down -v
+```
+
+### GPU support (optional)
+
+For faster embeddings on Linux with NVIDIA GPU, add to the `ollama` service in `docker-compose.yml`:
+
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - capabilities: [gpu]
+```
+
+---
+
 ## Using with Claude
 
 Once the MCP server is connected, Claude can access your vault directly — no special syntax needed. Just talk to it naturally.
@@ -100,120 +200,6 @@ obsidian-semantic-mcp/
 - An Obsidian vault on your filesystem
 - **macOS native:** Homebrew (auto-installs everything else)
 - **Docker modes:** Docker Desktop (macOS/Linux/Windows WSL2)
-
-## Quick Start
-
-### 1. Clone
-
-```bash
-git clone https://github.com/celstnblacc/obsidian-semantic-mcp.git && cd obsidian-semantic-mcp
-```
-
-### 2. Install dependencies and run the setup wizard
-
-```bash
-uv sync
-uv run osm init
-```
-
-> **Tip:** Run `uv run osm init --dry-run` first to preview every action without making any changes.
->
-> `scripts/osm` is a direct wrapper — if you prefer not to use `uv run`, `scripts/osm init` works identically without activating the venv.
-
-The wizard detects your OS and asks which installation mode you want:
-
-**macOS:**
-```
-  1)  Native              Homebrew + local Postgres + local Ollama
-  2)  Docker + host Ollama    Postgres in Docker, Ollama already on this Mac
-  3)  Full Docker         Everything in containers  (recommended)
-  4)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
-```
-
-**Linux:**
-```
-  1)  Docker + host Ollama    Postgres in Docker, Ollama on this machine
-  2)  Full Docker         Everything in containers  (recommended)
-  3)  Docker + remote Ollama  Postgres in Docker, Ollama on another machine
-```
-
-It then:
-- Installs prerequisites (Homebrew packages or Docker images)
-- Pulls `nomic-embed-text` if needed
-- Writes a `.env` file (gitignored) with your vault path and credentials
-- Updates `claude_desktop_config.json` automatically
-
-After the wizard completes, restart Claude Desktop — no further configuration needed.
-
----
-
-### Manual start (without wizard)
-
-```bash
-OBSIDIAN_VAULT="/path/to/your/vault" POSTGRES_PASSWORD=obsidian docker compose up -d
-```
-
-> Docker Compose also reads a `.env` file in the repo root (gitignored).
-
-First run pulls all images and the `nomic-embed-text` model automatically. This starts:
-
-| Service | Port | Description |
-|---------|------|-------------|
-| PostgreSQL + pgvector | 5433 | Vector storage (avoids conflict with host pg) |
-| Ollama | 11435 | Local embeddings (auto-pulls model) |
-| MCP server | stdio | Claude Desktop connects via `docker exec` |
-| Dashboard | 8484 | http://localhost:8484 |
-
-### 3. Configure Claude Desktop
-
-Add to `$HOME/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or the equivalent on your platform:
-
-```json
-{
-  "mcpServers": {
-    "obsidian-semantic": {
-      "command": "docker",
-      "args": ["exec", "-i", "obsidian-semantic-mcp-mcp-server-1", "python3", "src/server.py"],
-      "env": {}
-    }
-  }
-}
-```
-
-> **Container name note:** The container name `obsidian-semantic-mcp-mcp-server-1` is derived from the directory you cloned into. If you cloned into a different folder name, replace `obsidian-semantic-mcp` in the args with your actual directory name. Run `docker ps` to confirm the exact container name.
-
-### 4. Restart Claude Desktop
-
-The server indexes your vault on first run, then watches for changes automatically. Open the dashboard at http://localhost:8484 to monitor progress.
-
-### Useful commands
-
-```bash
-# View server logs
-docker compose logs -f mcp-server
-
-# Rebuild after code changes
-docker compose up -d --build mcp-server dashboard
-
-# Stop everything
-docker compose down
-
-# Stop and wipe all data (re-index from scratch)
-# ⚠️  WARNING: -v deletes all indexed embeddings. Re-indexing will restart from scratch.
-docker compose down -v
-```
-
-### GPU support (optional)
-
-For faster embeddings on Linux with NVIDIA GPU, add to the `ollama` service in `docker-compose.yml`:
-
-```yaml
-deploy:
-  resources:
-    reservations:
-      devices:
-        - capabilities: [gpu]
-```
 
 ## MCP Tools
 
